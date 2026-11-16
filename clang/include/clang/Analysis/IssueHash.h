@@ -10,10 +10,15 @@
 
 #include "llvm/ADT/SmallString.h"
 
+#include <map>
+#include <vector>
 namespace clang {
 class Decl;
 class FullSourceLoc;
 class LangOptions;
+class SourceManager;
+class SourceLocation;
+class Stmt;
 
 /// Returns an opaque identifier for a diagnostic.
 ///
@@ -72,6 +77,29 @@ std::string getIssueStringV2(const FullSourceLoc &IssueLoc,
                              llvm::StringRef CheckerName,
                              const Decl *IssueDecl,
                              const LangOptions &LangOpts);
+
+/// Source-level identity. Hash inputs contain no algorithm version, diagnostic
+/// prose, absolute paths, AST addresses or task/configuration identifiers.
+struct IssueIdentity {
+  std::string semantic, occurrence, declaration, anchor, role, macro;
+  std::string before, after, sourceDigest, quality, tokenKey, macroRole, macroDigest, macroOrder;
+  unsigned offset = 0;
+  std::string metadata() const;
+};
+struct IssueIdentitySource {
+  std::vector<std::string> tokens;
+  std::vector<unsigned> offsets;
+  std::string digest;
+};
+struct IssueIdentityCache {
+  std::map<unsigned, IssueIdentitySource> sources;
+  std::map<const Decl *, std::map<unsigned, std::pair<unsigned, const Stmt *>>> anchors;
+};
+IssueIdentity getIssueIdentity(SourceLocation Location, llvm::StringRef Checker,
+                               llvm::StringRef Problem, const Decl *Owner,
+                               const SourceManager &SM, const LangOptions &LO,
+                               IssueIdentityCache &Cache);
+
 } // namespace clang
 
 #endif

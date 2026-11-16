@@ -331,6 +331,7 @@ class SarifResult {
   std::string DiagnosticMessage;
   std::string HostedViewerURI;
   llvm::SmallDenseMap<StringRef, std::string, 4> PartialFingerprints;
+  llvm::SmallDenseMap<StringRef, std::string, 2> Properties;
   llvm::SmallVector<CharSourceRange, 8> Locations;
   llvm::SmallVector<CharSourceRange, 8> RelatedLocations;
   llvm::SmallVector<ThreadFlow, 8> ThreadFlows;
@@ -395,6 +396,9 @@ public:
     return *this;
   }
 
+  SarifResult setProperty(llvm::StringRef Key, llvm::StringRef Value) {
+    Properties[Key] = Value.str(); return *this;
+  }
   SarifResult addPartialFingerprint(llvm::StringRef key,
                                     llvm::StringRef value) {
     PartialFingerprints[key] = value;

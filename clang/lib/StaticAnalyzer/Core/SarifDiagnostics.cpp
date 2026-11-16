@@ -35,6 +35,7 @@ using namespace ento;
 
 namespace {
 class SarifDiagnostics : public PathDiagnosticConsumer {
+  IssueIdentityCache IdentityCache;
   std::string OutputFile;
   const LangOptions &LO;
   const SourceManager &SM;
@@ -217,6 +218,9 @@ SarifDiagnostics::createResult(const PathDiagnostic *Diag,
       SM);
   SmallString<32> IssueHashV2 =
       getIssueHashV2(FullLoc, CheckName, Diag->getDeclWithIssue(), LO);
+  auto Identity = getIssueIdentity(UPDLoc.isValid() ? UPDLoc.asLocation() :
+      Diag->getLocation().asLocation(), CheckName, Diag->getBugType(),
+      Diag->getDeclWithIssue(), SM, LO, IdentityCache);
 
   std::string HtmlReportURL;
   if (FM && !FM->empty()) {
@@ -244,6 +248,11 @@ SarifDiagnostics::createResult(const PathDiagnostic *Diag,
                     .addPartialFingerprint(IssueHashV2Key, IssueHashV2)
                     .setHostedViewerURI(HtmlReportURL)
                     .setThreadFlows(Flows);
+  if (!Identity.semantic.empty()) {
+    Result = Result.addPartialFingerprint("codexek/semantic", Identity.semantic)
+        .addPartialFingerprint("codexek/occurrence", Identity.occurrence)
+        .setProperty("codexek/identity", Identity.metadata());
+  }
   return Result;
 }
 
@@ -312,10 +321,12 @@ void SarifDiagnostics::FlushDiagnosticsImpl(
         }
         Events.push_back(std::move(Event));
       }
-      (*Result)["properties"] = json::Object{{"codexek/schema_version", 1},
-          {"codexek/events", std::move(Events)},
-          {"codexek/path_complete", false},
-          {"codexek/recovery_provenance", "unknown"}};
+      if (!Result->getObject("properties")) (*Result)["properties"] = json::Object{};
+      auto &Props = *Result->getObject("properties");
+      Props["codexek/schema_version"] = 1;
+      Props["codexek/events"] = std::move(Events);
+      Props["codexek/path_complete"] = false;
+      Props["codexek/recovery_provenance"] = "unknown";
       OS << json::Value(std::move(Doc)) << '\n';
     }
     return;
