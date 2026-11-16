@@ -5,5 +5,8 @@ if(CLANG_ENABLE_STATIC_ANALYZER AND CLANG_PLUGIN_SUPPORT AND LLVM_ENABLE_PLUGINS
   add_subdirectory(SampleAnalyzer)
   add_subdirectory(CheckerDependencyHandling)
   add_subdirectory(CheckerOptionHandling)
+endif()
+if(CLANG_ENABLE_STATIC_ANALYZER AND CLANG_PLUGIN_SUPPORT AND
+   (LLVM_ENABLE_PLUGINS OR LLVM_EXPORT_SYMBOLS_FOR_PLUGINS))
   add_subdirectory(CodexekKBExtract)
 endif()
