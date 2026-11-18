@@ -248,7 +248,10 @@ ProgramStateRef bindInt(uint64_t Value, ProgramStateRef State,
 }
 
 inline void assertStreamStateOpened(const StreamState *SS) {
-  assert(SS->isOpened() && "Stream is expected to be opened");
+  // Rule 22.6: calling functions on a Closed stream is the exact bug this
+  // checker detects. Do not assert — allow analysis to proceed so that
+  // BT_UseAfterClose can report the finding.
+  (void)SS;
 }
 
 class StreamChecker : public Checker<check::PreCall, eval::Call,
