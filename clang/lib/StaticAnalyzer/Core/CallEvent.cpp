@@ -613,7 +613,7 @@ RuntimeDefinition AnyFunctionCall::getRuntimeDefinition() const {
   }
 
   // Try to get CTU definition only if CTUDir is provided.
-  if (!Opts.IsNaiveCTUEnabled)
+  if (!Opts.IsNaiveCTUEnabled || Opts.CodexekCTUObjectOnly)
     return {};
 
   CTUCtx.setLinkClosureFile(Opts.CTULinkClosure);

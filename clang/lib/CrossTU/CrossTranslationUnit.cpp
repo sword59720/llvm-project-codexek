@@ -833,7 +833,7 @@ template <typename T> [[maybe_unused]] static bool hasBodyOrInit(const T *D) {
 }
 
 CrossTranslationUnitContext::CrossTranslationUnitContext(CompilerInstance &CI)
-    : Context(CI.getASTContext()), ASTStorage(CI) {
+    : Context(CI.getASTContext()), ObjectOnly(CI.getAnalyzerOpts().CodexekCTUObjectOnly), ASTStorage(CI) {
   if (CI.getAnalyzerOpts().ShouldEmitErrorsOnInvalidConfigValue &&
       !CI.getAnalyzerOpts().CTUDir.empty()) {
     auto S = CI.getVirtualFileSystem().status(CI.getAnalyzerOpts().CTUDir);
@@ -987,6 +987,8 @@ CrossTranslationUnitContext::getCrossTUDefinition(const FunctionDecl *FD,
                                                   StringRef CrossTUDir,
                                                   StringRef IndexName,
                                                   bool DisplayCTUProgress) {
+  if (ObjectOnly)
+    return llvm::make_error<IndexError>(index_error_code::failed_import);
   return getCrossTUDefinitionImpl(FD, CrossTUDir, IndexName,
                                   DisplayCTUProgress);
 }
@@ -1645,6 +1647,12 @@ CrossTranslationUnitContext::importDefinitionImpl(const T *D, ASTUnit *Unit) {
 llvm::Expected<const FunctionDecl *>
 CrossTranslationUnitContext::importDefinition(const FunctionDecl *FD,
                                               ASTUnit *Unit) {
+  // Object-only mode refuses every function-definition import at every
+  // public entry, before any importer state is touched: with the body veto
+  // active the importer would still materialize a bodyless target FD, and
+  // importDefinitionImpl's hasBodyOrInit assert fires on it.
+  if (ObjectOnly)
+    return llvm::make_error<IndexError>(index_error_code::failed_import);
   return importDefinitionImpl(FD, Unit);
 }
 
@@ -1658,6 +1666,59 @@ void CrossTranslationUnitContext::lazyInitImporterSharedSt(
     TranslationUnitDecl *ToTU) {
   if (!ImporterSharedSt)
     ImporterSharedSt = std::make_shared<ASTImporterSharedState>(*ToTU);
+}
+
+// The exported marker gates plugins built against the object-only SDK.
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+LLVM_EXTERNAL_VISIBILITY
+#endif
+unsigned clang_codexek_origin_sdk_v1() { return 1; }
+
+llvm::Expected<const VarDecl *>
+CrossTranslationUnitContext::importObjectDeclaration(const VarDecl *VD, ASTUnit *Unit) {
+  // Stage B1: file-scope C objects and function-scope static locals without
+  // any function references. Importing a static-local declaration pulls in
+  // its enclosing FunctionDecl as a context declaration (never a body — the
+  // body veto stays active for every import from this unit).
+  if (!VD || !Unit || &VD->getASTContext() != &Unit->getASTContext() ||
+      (!VD->isFileVarDecl() && !VD->isStaticLocal()) ||
+      Unit->getASTContext().getLangOpts().CPlusPlus)
+    return llvm::make_error<IndexError>(index_error_code::failed_import);
+  // ASTImporter can recursively import initializer dependencies. Restrict
+  // this entry point to C object graphs without any function references;
+  // this prevents incidental function-body imports and leaves the normal
+  // importer's cache/body-selection policy untouched for later source calls.
+  llvm::SmallPtrSet<const VarDecl *, 16> Seen;
+  unsigned Budget = 4096;
+  std::function<bool(const Stmt *)> SafeStmt;
+  std::function<bool(const VarDecl *)> SafeObject = [&](const VarDecl *V) {
+    if (!Seen.insert(V).second) return true;
+    if (!Budget-- || (!V->isFileVarDecl() && !V->isStaticLocal())) return false;
+    const VarDecl *Definition = nullptr;
+    const auto *Init = V->getAnyInitializer(Definition);
+    return !Init || SafeStmt(Init);
+  };
+  SafeStmt = [&](const Stmt *S) {
+    if (!S) return true;
+    if (!Budget--) return false;
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(S)) {
+      if (isa<FunctionDecl>(Ref->getDecl())) return false;
+      if (const auto *V = dyn_cast<VarDecl>(Ref->getDecl()))
+        if (!SafeObject(V)) return false;
+    }
+    for (const auto *Child : S->children())
+      if (!SafeStmt(Child)) return false;
+    return true;
+  };
+  if (!SafeObject(VD))
+    return llvm::make_error<IndexError>(index_error_code::failed_import);
+  auto Imported = getOrCreateASTImporter(Unit).Import(const_cast<VarDecl *>(VD));
+  if (!Imported) return Imported.takeError();
+  Context.getParentMapContext().clear();
+  return cast<VarDecl>(*Imported);
 }
 
 ASTImporter &
@@ -1721,6 +1782,7 @@ bool CrossTranslationUnitContext::isChosenCandidate(const Decl *D) const {
 // index errors never gate (they are reported through the lookup path).
 bool CrossTranslationUnitContext::shouldImportForeignBody(
     const FunctionDecl *FromFD) {
+  if (ObjectOnly) return false;
   const std::optional<std::string> LookupName = getLookupName(FromFD);
   if (!LookupName)
     return true;

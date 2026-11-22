@@ -25,6 +25,8 @@ if(CLANG_PLUGIN_SUPPORT AND (LLVM_ENABLE_PLUGINS OR LLVM_EXPORT_SYMBOLS_FOR_PLUG
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../include"
     "${CMAKE_BINARY_DIR}/tools/clang/include")
   if(APPLE)
+    # Match the extractor artifact name used by the product/runtime layout.
+    set_target_properties(CodexekKBExtract PROPERTIES SUFFIX ".so")
     target_link_options(CodexekKBExtract PRIVATE "-Wl,-undefined,dynamic_lookup")
   elseif(UNIX)
     target_link_options(CodexekKBExtract PRIVATE "-Wl,-z,undefs")

@@ -185,6 +185,11 @@ public:
   llvm::Expected<const VarDecl *> importDefinition(const VarDecl *VD,
                                                    ASTUnit *Unit);
 
+  /// Import a global C object (including a tentative definition) without
+  /// importing function bodies. Initializer dependencies are validated first.
+  llvm::Expected<const VarDecl *> importObjectDeclaration(const VarDecl *VD,
+                                                         ASTUnit *Unit);
+
   /// Get a name to identify a decl.
   static std::optional<std::string> getLookupName(const Decl *D);
 
@@ -247,6 +252,7 @@ private:
   ImporterMapTy ASTUnitImporterMap;
 
   ASTContext &Context;
+  bool ObjectOnly = false;
   std::shared_ptr<ASTImporterSharedState> ImporterSharedSt;
 
   using LoadResultTy = llvm::Expected<std::unique_ptr<ASTUnit>>;

@@ -61,6 +61,12 @@ public:
     return Eng.getAnalysisManager();
   }
 
+  /// Language SDK: object-only CTU resolution for call summaries. Merely
+  /// loading an external AST does not execute/import its function bodies.
+  cross_tu::CrossTranslationUnitContext *getCrossTranslationUnitContext() {
+    return Eng.getCrossTranslationUnitContext();
+  }
+
   ConstraintManager &getConstraintManager() {
     return Eng.getConstraintManager();
   }

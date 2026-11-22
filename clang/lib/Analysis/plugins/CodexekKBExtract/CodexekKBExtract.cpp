@@ -12,13 +12,20 @@
 //     pointer-returning plain C function, non-variadic, non-template,
 //     whose body is a linear sequence of:
 //       - constant-initialized local declarations,
-//       - `if (<condition>) return <constant-or-&global>;`   (no else),
+//       - `if (<condition>) return <constant-or-&object>;`   (no else),
 //       - `if (<condition>) return V1; else return V2;`,
-//       - `return <constant-or-&global>;`                    (the tail),
+//       - `return <constant-or-&object>;`                    (the tail),
 //     or a single `return <pointer param>;` with an unchanged pointer type.
 //     where <condition> is one of
 //       <integer param> == <int literal> | != | !<param> | bare <param>
 //     and every reachable path ends in a return.
+//
+//   <object> is a file-scope variable or a function-scope static local
+//   (static storage, no weak/alias/asm-label/TLS/volatile), used bare as a
+//   constant array or via & of the whole object, optionally refined by a
+//   constant chain of named fields and array subscripts rooted at it
+//   (`&s.f`, `&s.arr[2]`, `sa[1].f` — stage B2; the leaf-most subscript
+//   becomes the offset, earlier steps travel in the optional `path`).
 //
 //   Everything else => coverage "unsupported" with a reason. The extractor
 //   never emits a half-proven contract (the analogue of patch semantics:
@@ -52,6 +59,8 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/FileSystem.h"
 
 #include <optional>
 #include <string>
@@ -399,6 +408,423 @@ private:
   }
 };
 
+
+// A separate full-coverage leaf transfer retains return/output correlation.
+// Unsupported statements abort the whole contract, never just one exit.
+class OriginBody {
+  using Object = llvm::json::Object;
+  using Array = llvm::json::Array;
+  struct Path {
+    std::optional<Condition> guard;
+    Array writes;
+    Array effects;
+  };
+  const FunctionDecl &FD;
+  ASTContext &Ctx;
+  std::string TU;
+  Array Cases;
+  bool Failed = false;
+  unsigned Steps = 0;
+
+  std::string path(StringRef Name) {
+    SmallString<256> P(Name);
+    Ctx.getSourceManager().getFileManager().makeAbsolutePath(P);
+    llvm::sys::path::remove_dots(P, true);
+    return P.str().str();
+  }
+  // Stage B2: a constant field/array-element chain rooted at a static
+  // object (`&s.f`, `&s.arr[2]`, `sa[1].f`). Steps are collected leaf-first
+  // and reversed at the end; the leaf-most array subscript becomes the
+  // record's legacy `offset`, everything before it travels in `path`.
+  // Arrow dereferences, anonymous members and non-constant indices abort
+  // the chain (parameter pointee aliasing stays stage C).
+  std::optional<std::pair<const VarDecl *, llvm::json::Array>>
+  reduceChain(const Expr *Expression) {
+    llvm::json::Array LeafFirst;
+    const Expr *E = Expression->IgnoreParenImpCasts();
+    for (unsigned Guard = 0;; ++Guard) {
+      if (Guard > 16) return std::nullopt;
+      if (const auto *Sub = dyn_cast<ArraySubscriptExpr>(E)) {
+        const auto *Idx = Sub->getIdx()->IgnoreParenImpCasts();
+        Expr::EvalResult R;
+        if (!Idx->EvaluateAsInt(R, Ctx) || Idx->HasSideEffects(Ctx))
+          return std::nullopt;
+        auto V = R.Val.getInt().tryExtValue();
+        if (!V || *V < 0) return std::nullopt;
+        LeafFirst.push_back(Object{{"index", int64_t(*V)}});
+        E = Sub->getLHS()->IgnoreParenImpCasts();
+        continue;
+      }
+      if (const auto *M = dyn_cast<MemberExpr>(E)) {
+        if (M->isArrow()) return std::nullopt;
+        const auto *Field = dyn_cast<FieldDecl>(M->getMemberDecl());
+        if (!Field || !Field->getIdentifier() ||
+            Field->isAnonymousStructOrUnion())
+          return std::nullopt;
+        LeafFirst.push_back(Object{{"field", Field->getName().str()}});
+        E = M->getBase()->IgnoreParenImpCasts();
+        continue;
+      }
+      // Constant pointer arithmetic (`h + 1`) is the subscript form written
+      // with operators; negative results reject.
+      if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+        if (BO->getOpcode() != BO_Add && BO->getOpcode() != BO_Sub)
+          return std::nullopt;
+        const auto *Idx = BO->getRHS()->IgnoreParenImpCasts();
+        Expr::EvalResult R;
+        if (!Idx->EvaluateAsInt(R, Ctx) || Idx->HasSideEffects(Ctx))
+          return std::nullopt;
+        auto V = R.Val.getInt().tryExtValue();
+        if (!V) return std::nullopt;
+        int64_t Index = BO->getOpcode() == BO_Add ? int64_t(*V) : -int64_t(*V);
+        if (Index < 0) return std::nullopt;
+        LeafFirst.push_back(Object{{"index", Index}});
+        E = BO->getLHS()->IgnoreParenImpCasts();
+        continue;
+      }
+      break;
+    }
+    const auto *Ref = dyn_cast<DeclRefExpr>(E);
+    const auto *V = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+    if (!V) return std::nullopt;
+    std::reverse(LeafFirst.begin(), LeafFirst.end());
+    return std::make_pair(V, std::move(LeafFirst));
+  }
+  // Root-to-leaf type after every path step; the caller then applies the
+  // final array offset. Field lookup requires the complete record
+  // definition and named members only.
+  QualType terminalType(QualType Type, const llvm::json::Array &Path) const {
+    for (const auto &Step : Path) {
+      const auto *Object = Step.getAsObject();
+      if (!Object) return {};
+      if (const auto Field = Object->getString("field")) {
+        const auto *Record = Type->getAs<RecordType>();
+        if (!Record) return {};
+        const auto *Definition = Record->getDecl()->getDefinition();
+        if (!Definition) return {};
+        bool Found = false;
+        for (const auto *Member : Definition->fields()) {
+          if (Member->getIdentifier() && Member->getName() == *Field) {
+            Type = Member->getType();
+            Found = true;
+            break;
+          }
+        }
+        if (!Found) return {};
+      } else if (auto Index = Object->getInteger("index")) {
+        const auto *Array = Ctx.getAsConstantArrayType(Type);
+        if (!Array || *Index < 0 ||
+            llvm::APInt(64, uint64_t(*Index)).uge(Array->getSize().zextOrTrunc(64)))
+          return {};
+        Type = Array->getElementType();
+      } else {
+        return {};
+      }
+    }
+    return Type;
+  }
+  std::optional<Object> source(const Expr *Expression, QualType Target) {
+    if (!Expression || Target.isVolatileQualified() || Target->isAtomicType())
+      return std::nullopt;
+    if (Target->isIntegerType()) {
+      Expr::EvalResult R;
+      if (Expression->EvaluateAsInt(R, Ctx) && !Expression->HasSideEffects(Ctx)) {
+        // Constant-folded pointer arithmetic (e.g. the layout constant of
+        // `a[1] - a[0]`) evaluates fine but is not a source-identity fact;
+        // integer sources are status-code / write-slot literals only.
+        std::function<bool(const Stmt *)> HasPointerOperand = [&](const Stmt *S) {
+          if (const auto *E = dyn_cast<Expr>(S))
+            if (E->getType()->isPointerType() || E->getType()->isArrayType() ||
+                E->getType()->isReferenceType())
+              return true;
+          for (const Stmt *Child : S->children())
+            if (HasPointerOperand(Child)) return true;
+          return false;
+        };
+        if (!HasPointerOperand(Expression)) {
+          if (auto V = R.Val.getInt().tryExtValue())
+            return Object{{"kind", "integer"}, {"value", *V}};
+        }
+      }
+      // Stage C1: an unmodified integer parameter feeds a write effect with
+      // its call-site value; any other expression stays unsupported.
+      if (const auto *P = paramRef(Expression, FD)) {
+        if (!P->getType().isVolatileQualified() &&
+            Ctx.hasSameUnqualifiedType(P->getType(), Target)) {
+          for (unsigned I = 0; I < FD.getNumParams(); ++I)
+            if (FD.getParamDecl(I) == P)
+              return Object{{"kind", "argument"}, {"index", int64_t(I + 1)}};
+        }
+      }
+      return std::nullopt;
+    }
+    if (!Target->isPointerType()) return std::nullopt;
+    if (Expression->isNullPointerConstant(Ctx, Expr::NPC_ValueDependentIsNotNull))
+      return Object{{"kind", "null"}};
+    // Stage C2: a direct allocator call returns a fresh heap object whose
+    // identity is created per call instance — never merged across calls.
+    // void* implicitly converts to the requested pointee, so the call type
+    // may be void* or already the target pointer type.
+    if (const auto *Call = dyn_cast<CallExpr>(Expression->IgnoreParenImpCasts())) {
+      if (const auto *Callee = Call->getDirectCallee()) {
+        const auto *II = Callee->getIdentifier();
+        // A user definition of malloc/calloc/realloc is an allocator with
+        // unknown semantics — only the unimplemented (extern) standard
+        // declaration may carry heap-instance meaning.
+        if (II && !Callee->hasBody() &&
+            (II->isStr("malloc") || II->isStr("calloc") ||
+             II->isStr("realloc"))) {
+          const auto &Returned = Call->getType();
+          if (Ctx.hasSameUnqualifiedType(Returned, Target) ||
+              Ctx.hasSameType(Returned, Ctx.VoidPtrTy))
+            return Object{{"kind", "heap"}};
+        }
+      }
+    }
+    const auto *E = Expression->IgnoreParenImpCasts();
+    if (const auto *P = paramRef(E, FD)) {
+      if (P->getType().isVolatileQualified() || !Ctx.hasSameType(P->getType(), Target))
+        return std::nullopt;
+      for (unsigned I = 0; I < FD.getNumParams(); ++I)
+        if (FD.getParamDecl(I) == P)
+          return Object{{"kind", "argument"}, {"index", int64_t(I + 1)}};
+    }
+    bool Address = false;
+    if (const auto *U = dyn_cast<UnaryOperator>(E)) {
+      if (U->getOpcode() != UO_AddrOf) return std::nullopt;
+      E = U->getSubExpr()->IgnoreParens();
+      Address = true;
+    }
+    auto Chain = reduceChain(E);
+    const auto *V = Chain ? Chain->first : nullptr;
+    // Static locals have static storage and a USR rooted at their function,
+    // so the consumer's TU + USR identity disambiguates same-named objects;
+    // they are accepted alongside file-scope objects (stage B1).
+    if (!V || !V->hasGlobalStorage() || V->isWeak() ||
+        V->hasAttr<AliasAttr>() || V->hasAttr<AsmLabelAttr>() ||
+        V->getTLSKind() != VarDecl::TLS_None || V->getType().isVolatileQualified())
+      return std::nullopt;
+    // Path form (stage B2): root-to-leaf steps with the leaf-most array
+    // subscript carried as the legacy offset (== size stays a one-past
+    // source, matching the consumer bound). A chain with steps needs the
+    // address-of form only when the terminal is not an array decay.
+    llvm::json::Array Path;
+    int64_t Offset = 0;
+    bool LeafIndex = false;
+    QualType Element;
+    if (Chain && !Chain->second.empty()) {
+      Path = std::move(Chain->second);
+      // Leaf-most array subscript (original last after reverse) is the
+      // offset; == size stays a one-past source, > size is out of bounds
+      // and never extracted (never emit a half-proven contract).
+      if (auto Last = Path.back().getAsObject())
+        if (auto Index = Last->getInteger("index")) {
+          Offset = *Index;
+          LeafIndex = true;
+          Path.pop_back();
+        }
+      Element = terminalType(V->getType(), Path);
+      if (Element.isNull()) return std::nullopt;
+      if (LeafIndex || Offset) {
+        const auto *A = Ctx.getAsConstantArrayType(Element);
+        if (!A) return std::nullopt;
+        if (llvm::APInt(64, uint64_t(Offset)).ugt(A->getSize().zextOrTrunc(64)))
+          return std::nullopt;
+        Element = A->getElementType();
+      } else if (!Address) {
+        // Bare value form decays a terminal array to its first element
+        // (return s.arr), same as the root-only legacy branch.
+        if (const auto *A = Ctx.getAsConstantArrayType(Element))
+          Element = A->getElementType();
+      }
+    } else {
+      Element = V->getType();
+      if (!Address) {
+        const auto *A = Ctx.getAsConstantArrayType(Element);
+        if (!A) return std::nullopt;
+        Element = A->getElementType();
+      }
+    }
+    if (!Ctx.hasSameType(Ctx.getPointerType(Element), Target)) return std::nullopt;
+    SmallString<128> USR;
+    if (index::generateUSRForDecl(V, USR)) return std::nullopt;
+    auto &SM = Ctx.getSourceManager();
+    PrintingPolicy Policy(Ctx.getLangOpts());
+    Policy.SuppressTagKeyword = true;
+    Policy.Bool = true;
+    Object Result{{"kind", "object"}, {"usr", USR.str().str()},
+                  {"file", path(SM.getFilename(SM.getSpellingLoc(V->getLocation())))},
+                  {"tu", TU}, {"linkage", V->isExternallyVisible() ? "external" : "internal"},
+                  {"type", V->getType().getCanonicalType().getAsString(Policy)},
+                  {"offset", Offset}};
+    if (!Path.empty()) Result["path"] = std::move(Path);
+    return Result;
+  }
+  bool split(const Expr *E, const Path &P, Path &T, Path &F) {
+    Condition C;
+    std::string Why;
+    // The v1 codec carries one atom. Reject conjunctions rather than erase
+    // an earlier guard and publish an unsound complete contract.
+    if (P.guard || !recognizeCondition(E, FD, C, Why)) return false;
+    T = P; F = P;
+    T.guard = C;
+    C.equal = !C.equal;
+    F.guard = C;
+    return true;
+  }
+  void result(const Expr *E, Path P) {
+    if (const auto *C = dyn_cast_or_null<ConditionalOperator>(E ? E->IgnoreParens() : nullptr)) {
+      Path T, F;
+      if (!split(C->getCond(), P, T, F)) { Failed = true; return; }
+      result(C->getTrueExpr(), std::move(T));
+      result(C->getFalseExpr(), std::move(F));
+      return;
+    }
+    auto Value = FD.getReturnType()->isVoidType() && !E
+                     ? std::optional<Object>(Object{{"kind", "unknown"}})
+                     : source(E, FD.getReturnType());
+    if (!Value || Cases.size() >= 32) { Failed = true; return; }
+    Object Guard{{"always", true}};
+    if (P.guard)
+      Guard = Object{{"argument", int64_t(P.guard->param)},
+                     {"op", P.guard->equal ? "eq" : "ne"}, {"value", P.guard->value}};
+    Object Row{{"guard", std::move(Guard)}, {"return", std::move(*Value)},
+               {"writes", std::move(P.writes)}, {"unknown_effects", false}};
+    if (!P.effects.empty()) Row["effects"] = std::move(P.effects);
+    Cases.push_back(std::move(Row));
+  }
+  std::vector<Path> walk(const Stmt *S, std::vector<Path> Live, unsigned Depth) {
+    if (!S || Failed) return Live;
+    if (++Steps > 256 || Depth > 64) { Failed = true; return {}; }
+    if (const auto *Block = dyn_cast<CompoundStmt>(S)) {
+      for (const auto *Child : Block->body()) {
+        Live = walk(Child, std::move(Live), Depth + 1);
+        if (Live.empty() || Failed) break;
+      }
+      return Live;
+    }
+    if (isa<NullStmt>(S)) return Live;
+    // Local declarations are inert for pointer origins: constant-initialized
+    // (or uninitialized) objects never produce a source by themselves, and a
+    // returned local without static storage is rejected in source(). A
+    // variably-modified declaration evaluates a size expression with
+    // unmodeled effects, so it aborts the contract (stage B1).
+    if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+      for (const auto *D : DS->decls())
+        if (const auto *VD = dyn_cast<VarDecl>(D)) {
+          if (VD->getType()->isVariablyModifiedType()) { Failed = true; return {}; }
+          if (VD->hasInit() &&
+              !isa<IntegerLiteral>(VD->getInit()->IgnoreParenImpCasts())) {
+            Failed = true; return {};
+          }
+        }
+      return Live;
+    }
+    if (const auto *R = dyn_cast<ReturnStmt>(S)) {
+      for (auto &P : Live) result(R->getRetValue(), std::move(P));
+      return {};
+    }
+    if (const auto *If = dyn_cast<IfStmt>(S)) {
+      if (If->getInit() || If->getConditionVariable()) { Failed = true; return {}; }
+      std::vector<Path> Next;
+      for (const auto &P : Live) {
+        Path T, F;
+        if (!split(If->getCond(), P, T, F)) { Failed = true; return {}; }
+        auto A = walk(If->getThen(), {std::move(T)}, Depth + 1);
+        auto B = walk(If->getElse(), {std::move(F)}, Depth + 1);
+        for (auto &X : A) Next.push_back(std::move(X));
+        for (auto &X : B) Next.push_back(std::move(X));
+      }
+      return Next;
+    }
+    const auto *Assignment = dyn_cast<BinaryOperator>(S);
+    const auto *Deref = Assignment && Assignment->getOpcode() == BO_Assign
+                            ? dyn_cast<UnaryOperator>(Assignment->getLHS()->IgnoreParens()) : nullptr;
+    const auto *Param = Deref && Deref->getOpcode() == UO_Deref
+                            ? paramRef(Deref->getSubExpr(), FD) : nullptr;
+    // Stage C1: a plain-object assignment (`g.x = v`, `g.arr[1] = v`) is a
+    // global/static write effect. The target must reduce to a static root
+    // with a constant chain (no dereferenced pointer fields — those alias
+    // and stay unmodeled); the effect travels per case in `effects`.
+    if (Assignment && Assignment->getOpcode() == BO_Assign && !Param) {
+      auto Target = reduceChain(Assignment->getLHS()->IgnoreParenImpCasts());
+      const auto *Root = Target ? Target->first : nullptr;
+      if (!Root || !Root->hasGlobalStorage() || Root->isWeak() ||
+          Root->hasAttr<AliasAttr>() || Root->hasAttr<AsmLabelAttr>() ||
+          Root->getTLSKind() != VarDecl::TLS_None ||
+          Root->getType().isVolatileQualified()) { Failed = true; return {}; }
+      llvm::json::Array Steps = std::move(Target->second);
+      int64_t LeafOffset = 0;
+      if (!Steps.empty())
+        if (auto Last = Steps.back().getAsObject())
+          if (auto Index = Last->getInteger("index")) {
+            LeafOffset = *Index;
+            Steps.pop_back();
+          }
+      QualType Terminal = terminalType(Root->getType(), Steps);
+      if (Terminal.isNull()) { Failed = true; return {}; }
+      QualType ElementType = Terminal;
+      if (LeafOffset || isa<ConstantArrayType>(Terminal)) {
+        const auto *A = Ctx.getAsConstantArrayType(Terminal);
+        if (!A || llvm::APInt(64, uint64_t(LeafOffset)).ugt(A->getSize().zextOrTrunc(64)))
+          { Failed = true; return {}; }
+        ElementType = A->getElementType();
+      }
+      if (ElementType.isConstQualified() || ElementType.isVolatileQualified())
+        { Failed = true; return {}; }
+      auto Value = source(Assignment->getRHS(), ElementType);
+      if (!Value) { Failed = true; return {}; }
+      SmallString<128> USR;
+      if (index::generateUSRForDecl(Root, USR)) { Failed = true; return {}; }
+      auto &SM = Ctx.getSourceManager();
+      PrintingPolicy Policy(Ctx.getLangOpts());
+      Policy.SuppressTagKeyword = true;
+      Policy.Bool = true;
+      Object TargetDescriptor{{"kind", "object"}, {"usr", USR.str().str()},
+          {"file", path(SM.getFilename(SM.getSpellingLoc(Root->getLocation())))},
+          {"tu", TU}, {"linkage", Root->isExternallyVisible() ? "external" : "internal"},
+          {"type", Root->getType().getCanonicalType().getAsString(Policy)},
+          {"offset", LeafOffset}};
+      if (!Steps.empty()) TargetDescriptor["path"] = std::move(Steps);
+      for (auto &P : Live) {
+        if (!P.effects.empty()) { Failed = true; return {}; }
+        P.effects.push_back(Object{{"target", std::move(TargetDescriptor)},
+                                   {"value", Object(*Value)}});
+      }
+      return Live;
+    }
+    if (!Param || !Param->getType()->isPointerType() ||
+        Param->getType().isVolatileQualified()) { Failed = true; return {}; }
+    const auto Type = Param->getType()->getPointeeType();
+    auto Value = source(Assignment->getRHS(), Type);
+    if (!Value || Type.isConstQualified() || Type.isVolatileQualified()) {
+      Failed = true; return {};
+    }
+    for (auto &P : Live) {
+      // Until ordering/alias effects are represented, one write per path.
+      if (!P.writes.empty()) { Failed = true; return {}; }
+      const auto I = cast<ParmVarDecl>(Param)->getFunctionScopeIndex() + 1;
+      P.writes.push_back(Object{{"argument", int64_t(I)}, {"value", Object(*Value)}});
+    }
+    return Live;
+  }
+public:
+  OriginBody(const FunctionDecl &F, ASTContext &C, StringRef MainFile)
+      : FD(F), Ctx(C), TU(path(MainFile)) {}
+  std::optional<Object> extract() {
+    if (!FD.isExternallyVisible() || FD.isWeak() || FD.hasAttr<AsmLabelAttr>() ||
+        FD.isNoReturn() || FD.isVariadic() || isa<CXXMethodDecl>(FD) ||
+        FD.getTemplatedKind() != FunctionDecl::TK_NonTemplate || Ctx.getLangOpts().CPlusPlus)
+      return std::nullopt;
+    auto Remaining = walk(FD.getBody(), {Path{}}, 0);
+    if (FD.getReturnType()->isVoidType())
+      for (auto &P : Remaining) result(nullptr, std::move(P));
+    else if (!Remaining.empty()) Failed = true;
+    if (Failed || Cases.empty()) return std::nullopt;
+    return Object{{"version", int64_t(1)}, {"cases", std::move(Cases)}};
+  }
+};
+
 std::string canonicalSignature(const FunctionDecl &FD, ASTContext &Ctx) {
   PrintingPolicy Policy(Ctx.getLangOpts());
   Policy.SuppressTagKeyword = true;
@@ -454,7 +880,10 @@ std::optional<llvm::json::Object> forwardingCall(const FunctionDecl &FD,
   const auto *Call =
       Expression ? dyn_cast<CallExpr>(Expression->IgnoreParens()) : nullptr;
   const auto *Callee = Call ? Call->getDirectCallee() : nullptr;
-  if (!Callee || Callee->hasBody() || !Callee->isExternallyVisible() ||
+  // Stage B3: the callee may itself be a defined project leaf — prepare
+  // composes the wrapper contract from the leaf's extracted ORIGIN records
+  // (external callees keep the configured-contract composition path).
+  if (!Callee || !Callee->isExternallyVisible() ||
       Callee->isWeak() || Callee->isVariadic() || Callee->isNoReturn() ||
       !Callee->getType()->isFunctionProtoType() || Callee->getBuiltinID() ||
       Callee->hasAttr<AsmLabelAttr>() ||
@@ -468,13 +897,44 @@ std::optional<llvm::json::Object> forwardingCall(const FunctionDecl &FD,
   llvm::SmallDenseSet<const VarDecl *, 8> Used;
   llvm::json::Array Arguments;
   for (unsigned I = 0; I < Call->getNumArgs(); ++I) {
-    const auto *Param = paramRef(Call->getArg(I), FD);
-    if (!Param || Param->getType().isVolatileQualified() ||
-        !Ctx.hasSameType(Param->getType(), Callee->getParamDecl(I)->getType()) ||
-        !Used.insert(Param).second)
-      return std::nullopt;
-    const auto *Parm = cast<ParmVarDecl>(Param);
-    Arguments.push_back(static_cast<int64_t>(Parm->getFunctionScopeIndex()) + 1);
+    const auto *Arg = Call->getArg(I)->IgnoreParenImpCasts();
+    // Stage B3: integer arguments may also be `!param` (guard flip) or an
+    // integer literal (constant folding); pointer arguments stay identity
+    // so output locations map 1:1.
+    const auto *Param = paramRef(Arg, FD);
+    if (Param && !Param->getType().isVolatileQualified() &&
+        Ctx.hasSameType(Param->getType(), Callee->getParamDecl(I)->getType()) &&
+        Used.insert(Param).second) {
+      const auto *Parm = cast<ParmVarDecl>(Param);
+      Arguments.push_back(llvm::json::Object{
+          {"param", static_cast<int64_t>(Parm->getFunctionScopeIndex()) + 1}});
+      continue;
+    }
+    if (const auto *U = dyn_cast<UnaryOperator>(Arg)) {
+      if (U->getOpcode() == UO_LNot &&
+          Callee->getParamDecl(I)->getType()->isIntegerType()) {
+        const auto *Inner = paramRef(U->getSubExpr()->IgnoreParenImpCasts(), FD);
+        if (Inner && !Inner->getType().isVolatileQualified() &&
+            Inner->getType()->isIntegerType() &&
+            Ctx.hasSameUnqualifiedType(Inner->getType(),
+                                       Callee->getParamDecl(I)->getType()) &&
+            Used.insert(Inner).second) {
+          const auto *Parm = cast<ParmVarDecl>(Inner);
+          Arguments.push_back(llvm::json::Object{
+              {"not", static_cast<int64_t>(Parm->getFunctionScopeIndex()) + 1}});
+          continue;
+        }
+      }
+    }
+    Expr::EvalResult R;
+    if (Arg && Callee->getParamDecl(I)->getType()->isIntegerType() &&
+        Arg->EvaluateAsInt(R, Ctx) && !Arg->HasSideEffects(Ctx)) {
+      if (auto V = R.Val.getInt().tryExtValue()) {
+        Arguments.push_back(llvm::json::Object{{"const", *V}});
+        continue;
+      }
+    }
+    return std::nullopt;
   }
   return llvm::json::Object{{"callee_usr", std::move(USR)},
                             {"callee", Callee->getQualifiedNameAsString()},
@@ -508,6 +968,17 @@ class KBExtractConsumer : public ASTConsumer {
                             {"signature", E.signature}, {"linkage", E.linkage},
                             {"file", Location.isValid() ? Location.getFilename() : SourcePath},
                             {"line", static_cast<int64_t>(E.line)}};
+      // Variably modified declarators are evaluated on function entry.
+      // In particular, a bound such as c++ changes the value against which
+      // body guards are evaluated. The leaf language has no entry effects.
+      if (llvm::any_of(FD->parameters(), [](const ParmVarDecl *P) {
+            return P->getOriginalType()->isVariablyModifiedType();
+          })) {
+        JE["coverage"] = "unsupported";
+        JE["reason"] = "variably modified parameter has unmodeled entry evaluation";
+        Entries.push_back(std::move(JE));
+        continue;
+      }
       if (!FD->isVariadic())
         if (auto Forward = forwardingCall(*FD, Ctx)) {
           JE["coverage"] = "unsupported";
@@ -516,6 +987,25 @@ class KBExtractConsumer : public ASTConsumer {
           Entries.push_back(std::move(JE));
           continue;
         }
+      // Preserve existing RET/RETARG emission where the legacy leaf proof
+      // succeeds. The joint IR adds only the formerly unsupported shapes.
+      Entry Legacy = E;
+      BodyWalker LegacyWalker(*FD, Ctx, Legacy);
+      bool LegacyComplete = FD->getReturnType()->isPointerType() &&
+          LegacyWalker.walkBody(FD->getBody()) == BodyWalker::Flow::Terminates &&
+          !LegacyWalker.hasFailed();
+      if (!LegacyComplete) {
+        OriginBody Origin(*FD, Ctx, SourcePath);
+        if (auto Summary = Origin.extract()) {
+          llvm::json::Object Rec{{"schema", int64_t(2)}, {"function", E.name},
+              {"signature", E.signature}, {"unoverloaded", false}, {"kind", "ORIGIN"},
+              {"file", SourcePath}, {"line", int64_t(E.line)}, {"origins", std::move(*Summary)}};
+          JE["coverage"] = "complete";
+          JE["records"] = llvm::json::Array{std::move(Rec)};
+          Entries.push_back(std::move(JE));
+          continue;
+        }
+      }
       if (FD->isVariadic() || isa<CXXMethodDecl>(FD) ||
           FD->getTemplatedKind() != FunctionDecl::TK_NonTemplate ||
           !FD->getReturnType()->isPointerType()) {
