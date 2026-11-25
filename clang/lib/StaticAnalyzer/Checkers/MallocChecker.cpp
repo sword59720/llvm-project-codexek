@@ -571,6 +571,12 @@ public:
   mutable const KBMemoryRecord *ActiveKBFree = nullptr;
   void addKBFreeNote(BugReport &, CheckerContext &, SourceRange) const;
   bool evalKBMemory(const CallEvent &, CheckerContext &) const;
+  ProgramStateRef applyOriginRelease(CheckerContext &, const CallEvent &,
+                                     ProgramStateRef, SVal, unsigned, bool &) const;
+  ExplodedNode *deallocationErrorNode(CheckerContext &) const;
+  void deallocationSink(CheckerContext &) const;
+  mutable ProgramStateRef OriginReleaseState;
+  mutable bool *OriginReleaseDiagnosed = nullptr;
   bool ShouldIncludeOwnershipAnnotatedFunctions = false;
 
   bool ShouldRegisterNoOwnershipChangeVisitor = false;
@@ -1628,6 +1634,25 @@ void MallocChecker::checkCalloc(ProgramStateRef State, const CallEvent &Call,
   State = ProcessZeroAllocCheck(C, Call, 0, State);
   State = ProcessZeroAllocCheck(C, Call, 1, State);
   C.addTransition(State);
+}
+
+ProgramStateRef MallocChecker::applyOriginRelease(
+    CheckerContext &C, const CallEvent &Call, ProgramStateRef State,
+    SVal Value, unsigned Argument, bool &Diagnosed) const {
+  // For a wrapper argument, checkPreCall already diagnoses this same
+  // released value. Recovery can still reach the summary's post-call hook.
+  if (Argument)
+    if (SymbolRef Symbol = Value.getAsSymbol(/*IncludeBaseRegions=*/true))
+      if (const auto *Allocation = State->get<RegionState>(Symbol))
+        if (Allocation->isReleased()) return State;
+  const auto *Expr = Argument && Argument <= Call.getNumArgs()
+      ? Call.getArgExpr(Argument - 1) : Call.getOriginExpr();
+  bool Known = false;
+  llvm::SaveAndRestore<ProgramStateRef> ReleaseState(OriginReleaseState, State);
+  llvm::SaveAndRestore<bool *> ReleaseDiagnostic(OriginReleaseDiagnosed, &Diagnosed);
+  return FreeMemAux(C, Expr, Call, State, /*Hold=*/false, Known,
+                    AllocationFamily(AF_Malloc), /*ReturnsNullOnFailure=*/false,
+                    Value);
 }
 
 void MallocChecker::checkFree(ProgramStateRef State, const CallEvent &Call,
@@ -2866,6 +2891,16 @@ bool MallocChecker::SummarizeRegion(ProgramStateRef State, raw_ostream &os,
   }
 }
 
+ExplodedNode *MallocChecker::deallocationErrorNode(CheckerContext &C) const {
+  if (OriginReleaseDiagnosed) *OriginReleaseDiagnosed = true;
+  return C.generateErrorNode(OriginReleaseState);
+}
+
+void MallocChecker::deallocationSink(CheckerContext &C) const {
+  if (OriginReleaseDiagnosed) *OriginReleaseDiagnosed = true;
+  C.addSink(OriginReleaseState);
+}
+
 void MallocChecker::HandleNonHeapDealloc(CheckerContext &C, SVal ArgVal,
                                          SourceRange Range,
                                          const Expr *DeallocExpr,
@@ -2874,11 +2909,11 @@ void MallocChecker::HandleNonHeapDealloc(CheckerContext &C, SVal ArgVal,
   if (!Frontend)
     return;
   if (!Frontend->isEnabled()) {
-    C.addSink();
+    deallocationSink(C);
     return;
   }
 
-  if (ExplodedNode *N = C.generateErrorNode()) {
+  if (ExplodedNode *N = deallocationErrorNode(C)) {
     SmallString<100> buf;
     llvm::raw_svector_ostream os(buf);
 
@@ -2918,11 +2953,11 @@ void MallocChecker::HandleFreeAlloca(CheckerContext &C, SVal ArgVal,
   else if (MismatchedDeallocatorChecker.isEnabled())
     Frontend = &MismatchedDeallocatorChecker;
   else {
-    C.addSink();
+    deallocationSink(C);
     return;
   }
 
-  if (ExplodedNode *N = C.generateErrorNode()) {
+  if (ExplodedNode *N = deallocationErrorNode(C)) {
     auto R = std::make_unique<PathSensitiveBugReport>(
         Frontend->FreeAllocaBug,
         "Memory allocated by 'alloca()' should not be deallocated", N);
@@ -2939,11 +2974,11 @@ void MallocChecker::HandleMismatchedDealloc(CheckerContext &C,
                                             const RefState *RS, SymbolRef Sym,
                                             bool OwnershipTransferred) const {
   if (!MismatchedDeallocatorChecker.isEnabled()) {
-    C.addSink();
+    deallocationSink(C);
     return;
   }
 
-  if (ExplodedNode *N = C.generateErrorNode()) {
+  if (ExplodedNode *N = deallocationErrorNode(C)) {
     SmallString<100> buf;
     llvm::raw_svector_ostream os(buf);
 
@@ -2995,11 +3030,11 @@ void MallocChecker::HandleOffsetFree(CheckerContext &C, SVal ArgVal,
   if (!Frontend)
     return;
   if (!Frontend->isEnabled()) {
-    C.addSink();
+    deallocationSink(C);
     return;
   }
 
-  ExplodedNode *N = C.generateErrorNode();
+  ExplodedNode *N = deallocationErrorNode(C);
   if (!N)
     return;
 
@@ -3078,11 +3113,11 @@ void MallocChecker::HandleDoubleFree(CheckerContext &C, SourceRange Range,
   if (!Frontend)
     return;
   if (!Frontend->isEnabled()) {
-    C.addSink();
+    deallocationSink(C);
     return;
   }
 
-  if (ExplodedNode *N = C.generateErrorNode()) {
+  if (ExplodedNode *N = deallocationErrorNode(C)) {
     auto R = std::make_unique<PathSensitiveBugReport>(
         Frontend->DoubleFreeBug,
         (Released ? "Attempt to release already released memory"
@@ -3132,11 +3167,11 @@ void MallocChecker::HandleFunctionPtrFree(CheckerContext &C, SVal ArgVal,
   if (!Frontend)
     return;
   if (!Frontend->isEnabled()) {
-    C.addSink();
+    deallocationSink(C);
     return;
   }
 
-  if (ExplodedNode *N = C.generateErrorNode()) {
+  if (ExplodedNode *N = deallocationErrorNode(C)) {
     SmallString<100> Buf;
     llvm::raw_svector_ostream Os(Buf);
 
@@ -4557,4 +4592,37 @@ void clang_codexek_kb_memory_take_v1(
   const auto *Marker=(*State)->get<KBMemoryCalls>(Key);
   *Outcome=Marker ? *Marker : 0;
   if (Marker) *State=(*State)->remove<KBMemoryCalls>(Key);
+}
+
+// Apply a release to the same allocation state used by native malloc/free.
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+LLVM_EXTERNAL_VISIBILITY
+#endif
+bool clang_codexek_origin_release_v1(CheckerContext *C, const CallEvent *Call,
+                                     ProgramStateRef *State, const SVal *Value,
+                                     unsigned Argument) {
+  auto *Manager = C->getAnalysisManager().getCheckerManager();
+  if (!Manager->isRegisteredChecker<MallocChecker>()) return false;
+  bool Diagnosed = false;
+  auto Released = Manager->getChecker<MallocChecker>()->applyOriginRelease(
+      *C, *Call, *State, *Value, Argument, Diagnosed);
+  if (Released || Diagnosed) *State = std::move(Released);
+  return true;
+}
+
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+LLVM_EXTERNAL_VISIBILITY
+#endif
+bool clang_codexek_origin_released_v1(const ProgramState *State,
+                                      const MemRegion *Region) {
+  const auto *Symbolic = dyn_cast_or_null<SymbolicRegion>(Region);
+  if (!Symbolic) return false;
+  const auto *Allocation = State->get<RegionState>(Symbolic->getSymbol());
+  return Allocation && Allocation->isReleased();
 }

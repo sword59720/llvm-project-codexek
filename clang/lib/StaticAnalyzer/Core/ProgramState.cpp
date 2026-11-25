@@ -23,6 +23,32 @@
 using namespace clang;
 using namespace ento;
 
+// Both the producer and consumers of origin evidence share this trait index.
+REGISTER_SET_WITH_PROGRAMSTATE(CodexekOriginCandidate, const MemRegion *)
+
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+LLVM_EXTERNAL_VISIBILITY
+#endif
+void clang_codexek_origin_mark_candidate_v1(ProgramStateRef *State,
+                                           const MemRegion *Region) {
+  if (Region)
+    *State = (*State)->add<CodexekOriginCandidate>(Region->getBaseRegion());
+}
+
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+LLVM_EXTERNAL_VISIBILITY
+#endif
+bool clang_codexek_origin_candidate_v1(const ProgramState *State,
+                                      const MemRegion *Region) {
+  return Region && State->contains<CodexekOriginCandidate>(Region->getBaseRegion());
+}
+
 namespace clang { namespace  ento {
 /// Increments the number of times this state is referenced.
 

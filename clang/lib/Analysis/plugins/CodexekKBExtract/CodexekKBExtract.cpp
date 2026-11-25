@@ -47,8 +47,11 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/RecordLayout.h"
 #include "clang/AST/Stmt.h"
 #include "clang/AST/Type.h"
+#include "clang/Basic/Builtins.h"
 #include "clang/Analysis/CodexekKBInline.h"
 #include "clang/Basic/LangOptions.h"
 #include "clang/Basic/SourceManager.h"
@@ -58,7 +61,11 @@
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/SHA256.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/FileSystem.h"
 
@@ -111,6 +118,9 @@ struct Condition {
   unsigned param = 0; // 1-based
   bool equal = true;
   int64_t value = 0;
+  bool operator==(const Condition &o) const {
+    return param == o.param && equal == o.equal && value == o.value;
+  }
 };
 
 const VarDecl *paramRef(const Expr *E, const FunctionDecl &FD) {
@@ -204,6 +214,178 @@ bool recognizeCondition(const Expr *Cond, const FunctionDecl &FD,
   }
   why = "unrecognized condition shape";
   return false;
+}
+
+/* Stage D1: guard disjunctive-normal-form for ORIGIN joint cases
+ * (design §4.1 合取/析取). A clause is a conjunction of atoms; the case's
+ * guard is the disjunction of clauses. Legacy single-atom guards are the
+ * 1-clause 1-atom special case, so the record encoding stays backward
+ * compatible. Grammar budget: ≤ 8 clauses, ≤ 8 atoms per clause, nesting
+ * depth ≤ 4 — anything beyond fails the extraction (unsupported), never
+ * widens the frozen grammar. */
+struct GuardDnf {
+  std::vector<std::vector<Condition>> clauses;
+};
+
+constexpr unsigned GuardMaxClauses = 8;
+constexpr unsigned GuardMaxAtoms = 8;
+// Depth guards the RECURSION only; the clause/atom budgets below are the
+// real grammar bound. Counting raw AST nesting at 4 would silently cap a
+// flat `a1||...||aN` chain (depth N-1) at 5 atoms — far below the 8-clause
+// budget the DNF transform is prepared to hold (8-depth recursion is still
+// trivially safe). 审查任务2 问题3。
+constexpr unsigned GuardMaxDepth = 8;
+
+// Dedupe clauses; an empty (vacuous) clause makes the whole DNF TRUE.
+void normalizeDnf(GuardDnf &G) {
+  for (auto &clause : G.clauses) {
+    std::sort(clause.begin(), clause.end(), [](const Condition &a, const Condition &b) {
+      if (a.param != b.param) return a.param < b.param;
+      if (a.equal != b.equal) return a.equal < b.equal;
+      return a.value < b.value;
+    });
+    clause.erase(std::unique(clause.begin(), clause.end(),
+                             [](const Condition &a, const Condition &b) {
+                               return a.param == b.param && a.equal == b.equal &&
+                                      a.value == b.value;
+                             }),
+                 clause.end());
+  }
+  std::sort(G.clauses.begin(), G.clauses.end(),
+            [](const std::vector<Condition> &a, const std::vector<Condition> &b) {
+              if (a.size() != b.size()) return a.size() < b.size();
+              for (size_t i = 0; i < a.size(); ++i)
+                if (a[i].param != b[i].param) return a[i].param < b[i].param;
+              return false;
+            });
+  G.clauses.erase(std::unique(G.clauses.begin(), G.clauses.end(),
+                              [](const std::vector<Condition> &a,
+                                 const std::vector<Condition> &b) {
+                                return a == b;
+                              }),
+                  G.clauses.end());
+}
+
+// Conjunction = cross product of clauses. Fails (nullopt) when the product
+// would exceed the clause budget — conservative unsupported, never widening.
+std::optional<GuardDnf> conjDnf(const GuardDnf &A, const GuardDnf &B) {
+  if (A.clauses.size() * B.clauses.size() > GuardMaxClauses) return std::nullopt;
+  GuardDnf Out;
+  for (const auto &a : A.clauses)
+    for (const auto &b : B.clauses) {
+      std::vector<Condition> merged = a;
+      merged.insert(merged.end(), b.begin(), b.end());
+      if (merged.size() > GuardMaxAtoms) return std::nullopt;
+      Out.clauses.push_back(std::move(merged));
+    }
+  normalizeDnf(Out);
+  return Out;
+}
+
+// Disjunction = clause union.
+std::optional<GuardDnf> disjDnf(const GuardDnf &A, const GuardDnf &B) {
+  if (A.clauses.size() + B.clauses.size() > GuardMaxClauses) return std::nullopt;
+  GuardDnf Out = A;
+  Out.clauses.insert(Out.clauses.end(), B.clauses.begin(), B.clauses.end());
+  normalizeDnf(Out);
+  return Out;
+}
+
+// Negation by De Morgan: flip every atom (eq<->ne stays in grammar) and take
+// the cross product over clauses. Fails when the product would blow the
+// budget — the caller treats a negation failure as unsupported.
+std::optional<GuardDnf> negateDnf(const GuardDnf &G) {
+  std::vector<std::vector<Condition>> negated;
+  negated.reserve(G.clauses.size());
+  for (const auto &clause : G.clauses) {
+    std::vector<Condition> flipped;
+    flipped.reserve(clause.size());
+    for (const auto &atom : clause) {
+      Condition F = atom;
+      F.equal = !F.equal;
+      flipped.push_back(F);
+    }
+    negated.push_back(std::move(flipped));
+  }
+  GuardDnf Out;
+  Out.clauses.push_back({});
+  for (const auto &flipped : negated) {
+    if (Out.clauses.size() * flipped.size() > GuardMaxClauses) return std::nullopt;
+    std::vector<std::vector<Condition>> next;
+    for (const auto &partial : Out.clauses)
+      for (const auto &atom : flipped) {
+        std::vector<Condition> merged = partial;
+        merged.push_back(atom);
+        if (merged.size() > GuardMaxAtoms) return std::nullopt;
+        next.push_back(std::move(merged));
+      }
+    Out.clauses = std::move(next);
+  }
+  normalizeDnf(Out);
+  return Out;
+}
+
+// Recognize a compound guard expression: parenthesized leaf conditions
+// joined by && / ||, with !prefix delegating to atom negation + De Morgan.
+bool recognizeGuardDnf(const Expr *E, const FunctionDecl &FD, GuardDnf &G,
+                       std::string &why, unsigned depth = 0) {
+  if (depth > GuardMaxDepth) {
+    why = "compound guard nesting beyond budget";
+    return false;
+  }
+  const Expr *Stripped = E ? E->IgnoreParenImpCasts() : nullptr;
+  if (const auto *BO = dyn_cast_or_null<BinaryOperator>(Stripped)) {
+    if (BO->getOpcode() == BO_LAnd || BO->getOpcode() == BO_LOr) {
+      GuardDnf L, R;
+      if (!recognizeGuardDnf(BO->getLHS(), FD, L, why, depth + 1) ||
+          !recognizeGuardDnf(BO->getRHS(), FD, R, why, depth + 1))
+        return false;
+      auto Merged = BO->getOpcode() == BO_LAnd ? conjDnf(L, R) : disjDnf(L, R);
+      if (!Merged) {
+        why = "compound guard clause budget exceeded";
+        return false;
+      }
+      G = std::move(*Merged);
+      return true;
+    }
+  }
+  if (const auto *UO = dyn_cast_or_null<UnaryOperator>(Stripped)) {
+    if (UO->getOpcode() == UO_LNot) {
+      GuardDnf Inner;
+      if (!recognizeGuardDnf(UO->getSubExpr(), FD, Inner, why, depth + 1))
+        return false;
+      auto Negated = negateDnf(Inner);
+      if (!Negated) {
+        why = "compound guard clause budget exceeded";
+        return false;
+      }
+      G = std::move(*Negated);
+      return true;
+    }
+  }
+  Condition C;
+  if (!recognizeCondition(Stripped, FD, C, why)) return false;
+  G.clauses.push_back({C});
+  return true;
+}
+
+// Joint-case guard encoding: single atom keeps the legacy flat record;
+// anything compound becomes {"any": [{"all": [atom...]}, ...]}.
+llvm::json::Object encodeGuard(const std::optional<GuardDnf> &guard) {
+  if (!guard) return llvm::json::Object{{"always", true}};
+  auto atom = [](const Condition &C) {
+    return llvm::json::Object{{"argument", int64_t(C.param)},
+                              {"op", C.equal ? "eq" : "ne"}, {"value", C.value}};
+  };
+  if (guard->clauses.size() == 1 && guard->clauses[0].size() == 1)
+    return atom(guard->clauses[0][0]);
+  llvm::json::Array Any;
+  for (const auto &clause : guard->clauses) {
+    llvm::json::Array All;
+    for (const auto &C : clause) All.push_back(llvm::json::Value(atom(C)));
+    Any.push_back(llvm::json::Value(llvm::json::Object{{"all", std::move(All)}}));
+  }
+  return llvm::json::Object{{"any", std::move(Any)}};
 }
 
 // Null and the address of a strong, non-thread-local object with static
@@ -411,20 +593,122 @@ private:
 
 // A separate full-coverage leaf transfer retains return/output correlation.
 // Unsupported statements abort the whole contract, never just one exit.
+// Stage D2 forward declarations (defined after the extract plumbing; the
+// OriginBody walker emits forwarded return sources from within result()).
+std::optional<llvm::json::Object> forwardedReturnSource(
+    const Expr *Expression, const FunctionDecl &FD, ASTContext &Ctx);
+std::string generateUSR(const FunctionDecl &FD);
+std::string canonicalSignature(const FunctionDecl &FD, ASTContext &Ctx);
+bool forwardArgumentMapping(const CallExpr &Call, const FunctionDecl &FD,
+                            const FunctionDecl &Callee, ASTContext &Ctx,
+                            llvm::json::Array &Arguments);
+
+/* Stage D3: known-target table for STATIC function-pointer globals (design
+ * §5 间接调用). A pointer participates only while its target set is
+ * CLOSED: every write visible in this TU resolves to a direct function and
+ * the pointer's own address never escapes. Internal (static) linkage makes
+ * the TU the whole assignment domain, so closure here is a sound claim;
+ * external function pointers stay out (cross-TU writes are invisible). */
+class FpTargetTable {
+public:
+  static bool isTrackable(const VarDecl &V, ASTContext &Ctx) {
+    const auto &canonical = *V.getCanonicalDecl();
+    if (Ctx.getLangOpts().CPlusPlus || canonical.getStorageClass() != SC_Static ||
+        !canonical.hasGlobalStorage() || canonical.getType().isVolatileQualified() ||
+        canonical.hasAttr<AsmLabelAttr>())
+      return false;
+    if (canonical.isExternallyVisible()) return false;
+    const auto *pt = canonical.getType()->getAs<PointerType>();
+    return pt && pt->getPointeeType()->isFunctionProtoType();
+  }
+
+  bool closed(const VarDecl &fp) const {
+    return !unmodeledStorage && targets.count(&fp) > 0 && open.count(&fp) == 0;
+  }
+
+  const std::set<const FunctionDecl *> *targetsOf(const VarDecl &fp) const {
+    auto it = targets.find(&fp);
+    return it == targets.end() ? nullptr : &it->second;
+  }
+
+  bool isTarget(const FunctionDecl &FD) const {
+    return functionTargets.count(FD.getCanonicalDecl()) != 0;
+  }
+
+  bool unmodeledStorage = false;
+  llvm::SmallDenseSet<const FunctionDecl *, 16> functionTargets;
+  std::map<const VarDecl *, std::set<const FunctionDecl *>> targets;
+  std::set<const VarDecl *> open;
+};
+
 class OriginBody {
   using Object = llvm::json::Object;
   using Array = llvm::json::Array;
   struct Path {
-    std::optional<Condition> guard;
+    std::optional<GuardDnf> guard; // nullopt = always (vacuous conjunction)
     Array writes;
     Array effects;
   };
   const FunctionDecl &FD;
   ASTContext &Ctx;
   std::string TU;
+  const FpTargetTable *Fps = nullptr;
   Array Cases;
   bool Failed = false;
+  std::string Why;
   unsigned Steps = 0;
+  bool HasDispatch = false;
+
+  void fail(StringRef reason) {
+    if (!Failed) {
+      Failed = true;
+      Why = reason.str();
+    }
+  }
+
+  // Stage D3: one forwarded origin per known target of a CLOSED static
+  // function pointer (design §5: 已知目标合并为案例并集、未知目标保守).
+  // The dispatch guard stays with each case; the union across targets is the
+  // case set, and regions outside the dispatch guard stay runtime-
+  // conservative. Arguments map through the frozen grammar once (the
+  // targets share the pointer's prototype).
+  std::vector<Object> dispatchedReturnSources(const Expr *Expression) {
+    const auto *Call =
+        Expression ? dyn_cast<CallExpr>(Expression->IgnoreParens()) : nullptr;
+
+    if (!Call || !Fps) return {};
+    const auto *Ref =
+        dyn_cast<DeclRefExpr>(Call->getCallee()->IgnoreParenImpCasts());
+    const auto *fp = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+    if (!fp) return {};
+    fp = fp->getCanonicalDecl();
+    if (!Fps->closed(*fp)) return {};
+    const auto *known = Fps->targetsOf(*fp);
+    if (!known || known->empty()) return {};
+    const auto *proto =
+        fp->getType()->getPointeeType()->getAs<FunctionProtoType>();
+    if (!proto || proto->getNumParams() != Call->getNumArgs()) return {};
+    std::map<std::string, Object> ordered;
+    for (const auto *target : *known) {
+      if (!Ctx.hasSameType(fp->getType()->getPointeeType(), target->getType()) ||
+          target->isWeak() || target->hasAttr<AsmLabelAttr>())
+        return {};
+      llvm::json::Array arguments;
+      if (!forwardArgumentMapping(*Call, FD, *target, Ctx, arguments))
+        return {};
+      auto USR = generateUSR(*target);
+      if (USR.empty()) return {};
+      ordered.try_emplace(USR, Object{{"kind", "forwarded"},
+                                      {"callee_usr", USR},
+                                      {"signature", canonicalSignature(*target, Ctx)},
+                                      {"arguments", std::move(arguments)}});
+    }
+    std::vector<Object> out;
+    for (auto &[usr, source] : ordered)
+      out.push_back(std::move(source));
+    HasDispatch = !out.empty();
+    return out;
+  }
 
   std::string path(StringRef Name) {
     SmallString<256> P(Name);
@@ -661,41 +945,78 @@ class OriginBody {
     return Result;
   }
   bool split(const Expr *E, const Path &P, Path &T, Path &F) {
-    Condition C;
+    GuardDnf C;
     std::string Why;
-    // The v1 codec carries one atom. Reject conjunctions rather than erase
-    // an earlier guard and publish an unsound complete contract.
-    if (P.guard || !recognizeCondition(E, FD, C, Why)) return false;
-    T = P; F = P;
-    T.guard = C;
-    C.equal = !C.equal;
-    F.guard = C;
+    // Stage D1: compound guards are recognized as a DNF within the frozen
+    // grammar budget. A nested guard conjuncts with the live path guard
+    // (the previous "reject rather than erase" rule — the conjunction now
+    // keeps the earlier guard instead of dropping it); a budget overflow
+    // fails the extraction conservatively.
+    if (!recognizeGuardDnf(E, FD, C, Why)) {
+      fail("joint origin guard unsupported: " + Why);
+      return false;
+    }
+    T = P;
+    F = P;
+    if (P.guard) {
+      auto Conj = conjDnf(*P.guard, C);
+      auto Negated = negateDnf(C);
+      if (!Conj || !Negated) return false;
+      auto FConj = conjDnf(*P.guard, *Negated);
+      if (!FConj) return false;
+      T.guard = std::move(*Conj);
+      F.guard = std::move(*FConj);
+      return true;
+    }
+    T.guard = std::move(C);
+    auto Negated = negateDnf(*T.guard);
+    if (!Negated) return false;
+    F.guard = std::move(*Negated);
     return true;
   }
   void result(const Expr *E, Path P) {
     if (const auto *C = dyn_cast_or_null<ConditionalOperator>(E ? E->IgnoreParens() : nullptr)) {
       Path T, F;
-      if (!split(C->getCond(), P, T, F)) { Failed = true; return; }
+      if (!split(C->getCond(), P, T, F)) { fail("nested ternary guard beyond the frozen budget"); return; }
       result(C->getTrueExpr(), std::move(T));
       result(C->getFalseExpr(), std::move(F));
       return;
     }
-    auto Value = FD.getReturnType()->isVoidType() && !E
-                     ? std::optional<Object>(Object{{"kind", "unknown"}})
-                     : source(E, FD.getReturnType());
-    if (!Value || Cases.size() >= 32) { Failed = true; return; }
-    Object Guard{{"always", true}};
-    if (P.guard)
-      Guard = Object{{"argument", int64_t(P.guard->param)},
-                     {"op", P.guard->equal ? "eq" : "ne"}, {"value", P.guard->value}};
-    Object Row{{"guard", std::move(Guard)}, {"return", std::move(*Value)},
-               {"writes", std::move(P.writes)}, {"unknown_effects", false}};
-    if (!P.effects.empty()) Row["effects"] = std::move(P.effects);
-    Cases.push_back(std::move(Row));
+    std::vector<Object> values;
+    if (FD.getReturnType()->isVoidType() && !E) {
+      values.push_back(Object{{"kind", "unknown"}});
+    } else if (auto V = source(E, FD.getReturnType())) {
+      values.push_back(std::move(*V));
+    } else if (auto V = forwardedReturnSource(E, FD, Ctx)) {
+      // Stage D2: a return of `callee(args)` inside the frozen mapping
+      // grammar is a forwarded source — the SCC transfer composes it
+      // against the callee candidate; an unresolved callee keeps the case
+      // and the composition drops it (partial), never fabricates.
+      values.push_back(std::move(*V));
+    } else {
+      // Stage D3: indirect dispatch through a closed static function
+      // pointer — one forwarded case per known target; an open set
+      // yields nothing and the extraction fails conservatively.
+      values = dispatchedReturnSources(E);
+    }
+    if (values.empty() || Cases.size() + values.size() > 32) {
+      fail(values.empty() ? "unrepresentable return source"
+                          : "case count beyond budget");
+      return;
+    }
+    Object Guard = encodeGuard(P.guard);
+    const bool approximate = values.size() > 1;
+    for (auto &V : values) {
+      Object Row{{"guard", Object(Guard)}, {"return", std::move(V)},
+                 {"writes", llvm::json::Array(P.writes)}, {"unknown_effects", false}};
+      if (approximate) Row["approximate"] = true;
+      if (!P.effects.empty()) Row["effects"] = llvm::json::Array(P.effects);
+      Cases.push_back(std::move(Row));
+    }
   }
   std::vector<Path> walk(const Stmt *S, std::vector<Path> Live, unsigned Depth) {
     if (!S || Failed) return Live;
-    if (++Steps > 256 || Depth > 64) { Failed = true; return {}; }
+    if (++Steps > 256 || Depth > 64) { fail("statement walk beyond budget"); return {}; }
     if (const auto *Block = dyn_cast<CompoundStmt>(S)) {
       for (const auto *Child : Block->body()) {
         Live = walk(Child, std::move(Live), Depth + 1);
@@ -712,10 +1033,11 @@ class OriginBody {
     if (const auto *DS = dyn_cast<DeclStmt>(S)) {
       for (const auto *D : DS->decls())
         if (const auto *VD = dyn_cast<VarDecl>(D)) {
-          if (VD->getType()->isVariablyModifiedType()) { Failed = true; return {}; }
+          if (VD->getType()->isVariablyModifiedType()) { fail("variably modified local declaration"); return {}; }
           if (VD->hasInit() &&
               !isa<IntegerLiteral>(VD->getInit()->IgnoreParenImpCasts())) {
-            Failed = true; return {};
+            fail("local declaration with non-constant initializer");
+            return {};
           }
         }
       return Live;
@@ -725,17 +1047,53 @@ class OriginBody {
       return {};
     }
     if (const auto *If = dyn_cast<IfStmt>(S)) {
-      if (If->getInit() || If->getConditionVariable()) { Failed = true; return {}; }
+      if (If->getInit() || If->getConditionVariable()) { fail("if with init/condition variable"); return {}; }
       std::vector<Path> Next;
       for (const auto &P : Live) {
         Path T, F;
-        if (!split(If->getCond(), P, T, F)) { Failed = true; return {}; }
+        if (!split(If->getCond(), P, T, F)) { fail("if condition beyond the frozen guard grammar"); return {}; }
         auto A = walk(If->getThen(), {std::move(T)}, Depth + 1);
         auto B = walk(If->getElse(), {std::move(F)}, Depth + 1);
         for (auto &X : A) Next.push_back(std::move(X));
         for (auto &X : B) Next.push_back(std::move(X));
       }
       return Next;
+    }
+    if (const auto *Call = dyn_cast<CallExpr>(S)) {
+      const auto *Callee = Call->getDirectCallee();
+      if (!Callee || !Callee->getIdentifier() || Callee->getBuiltinID() != Builtin::BIfree ||
+          Callee->isDefined() ||
+          Callee->isWeak() || Callee->hasAttr<AsmLabelAttr>() ||
+          Callee->isVariadic() || !Callee->getDeclContext()->isTranslationUnit() ||
+          Callee->getNumParams() != 1 || Call->getNumArgs() != 1 ||
+          !Callee->getReturnType()->isVoidType() ||
+          !Ctx.hasSameType(Callee->getParamDecl(0)->getType(), Ctx.VoidPtrTy)) {
+        fail("unsupported call effect");
+        return {};
+      }
+      const auto *Arg = Call->getArg(0)->IgnoreParenImpCasts();
+      QualType type = Arg->getType();
+      if (type->isArrayType()) type = Ctx.getArrayDecayedType(type);
+      auto target = source(Arg, type->isPointerType() ? type : Ctx.VoidPtrTy);
+      if (!target || target->getString("kind") == "heap") {
+        fail("free target is not a stable input or object");
+        return {};
+      }
+      if (target->getString("kind") == "null") return Live;
+      auto freeUsr = generateUSR(*Callee);
+      if (freeUsr.empty()) {
+        fail("free declaration identity is unavailable");
+        return {};
+      }
+      for (auto &P : Live) {
+        if (!P.writes.empty() || !P.effects.empty()) {
+          fail("free combined with another memory effect");
+          return {};
+        }
+        P.effects.push_back(Object{{"kind", "free"}, {"target", Object(*target)},
+                                   {"callee_usr", freeUsr}});
+      }
+      return Live;
     }
     const auto *Assignment = dyn_cast<BinaryOperator>(S);
     const auto *Deref = Assignment && Assignment->getOpcode() == BO_Assign
@@ -752,7 +1110,7 @@ class OriginBody {
       if (!Root || !Root->hasGlobalStorage() || Root->isWeak() ||
           Root->hasAttr<AliasAttr>() || Root->hasAttr<AsmLabelAttr>() ||
           Root->getTLSKind() != VarDecl::TLS_None ||
-          Root->getType().isVolatileQualified()) { Failed = true; return {}; }
+          Root->getType().isVolatileQualified()) { fail("unmodeled write target (weak/alias/TLS/volatile/non-global)"); return {}; }
       llvm::json::Array Steps = std::move(Target->second);
       int64_t LeafOffset = 0;
       if (!Steps.empty())
@@ -762,20 +1120,20 @@ class OriginBody {
             Steps.pop_back();
           }
       QualType Terminal = terminalType(Root->getType(), Steps);
-      if (Terminal.isNull()) { Failed = true; return {}; }
+      if (Terminal.isNull()) { fail("write chain type does not reduce"); return {}; }
       QualType ElementType = Terminal;
       if (LeafOffset || isa<ConstantArrayType>(Terminal)) {
         const auto *A = Ctx.getAsConstantArrayType(Terminal);
         if (!A || llvm::APInt(64, uint64_t(LeafOffset)).ugt(A->getSize().zextOrTrunc(64)))
-          { Failed = true; return {}; }
+          { fail("effect offset outside the array bounds"); return {}; }
         ElementType = A->getElementType();
       }
       if (ElementType.isConstQualified() || ElementType.isVolatileQualified())
-        { Failed = true; return {}; }
+        { fail("write target element is const/volatile qualified"); return {}; }
       auto Value = source(Assignment->getRHS(), ElementType);
-      if (!Value) { Failed = true; return {}; }
+      if (!Value) { fail("effect value is unrepresentable"); return {}; }
       SmallString<128> USR;
-      if (index::generateUSRForDecl(Root, USR)) { Failed = true; return {}; }
+      if (index::generateUSRForDecl(Root, USR)) { fail("USR generation failed for the write target"); return {}; }
       auto &SM = Ctx.getSourceManager();
       PrintingPolicy Policy(Ctx.getLangOpts());
       Policy.SuppressTagKeyword = true;
@@ -787,41 +1145,62 @@ class OriginBody {
           {"offset", LeafOffset}};
       if (!Steps.empty()) TargetDescriptor["path"] = std::move(Steps);
       for (auto &P : Live) {
-        if (!P.effects.empty()) { Failed = true; return {}; }
+        if (!P.effects.empty()) { fail("one write effect per path is representable"); return {}; }
         P.effects.push_back(Object{{"target", std::move(TargetDescriptor)},
                                    {"value", Object(*Value)}});
       }
       return Live;
     }
     if (!Param || !Param->getType()->isPointerType() ||
-        Param->getType().isVolatileQualified()) { Failed = true; return {}; }
+        Param->getType().isVolatileQualified()) { fail("assignment target is not a pointee parameter"); return {}; }
     const auto Type = Param->getType()->getPointeeType();
     auto Value = source(Assignment->getRHS(), Type);
     if (!Value || Type.isConstQualified() || Type.isVolatileQualified()) {
-      Failed = true; return {};
+      fail("output write value unrepresentable or target qualified");
+      return {};
     }
     for (auto &P : Live) {
       // Until ordering/alias effects are represented, one write per path.
-      if (!P.writes.empty()) { Failed = true; return {}; }
+      if (!P.writes.empty() ||
+          (!P.effects.empty() && P.effects.front().getAsObject()->getString("kind") == "free")) {
+        fail("output write combined with another write or release");
+        return {};
+      }
       const auto I = cast<ParmVarDecl>(Param)->getFunctionScopeIndex() + 1;
       P.writes.push_back(Object{{"argument", int64_t(I)}, {"value", Object(*Value)}});
     }
     return Live;
   }
 public:
-  OriginBody(const FunctionDecl &F, ASTContext &C, StringRef MainFile)
-      : FD(F), Ctx(C), TU(path(MainFile)) {}
+  OriginBody(const FunctionDecl &F, ASTContext &C, StringRef MainFile,
+             const FpTargetTable *Fps = nullptr)
+      : FD(F), Ctx(C), TU(path(MainFile)), Fps(Fps) {}
+  bool hasFailed() const { return Failed; }
+  bool hasDispatch() const { return HasDispatch; }
+  const std::string &failureWhy() const { return Why; }
   std::optional<Object> extract() {
-    if (!FD.isExternallyVisible() || FD.isWeak() || FD.hasAttr<AsmLabelAttr>() ||
-        FD.isNoReturn() || FD.isVariadic() || isa<CXXMethodDecl>(FD) ||
+    if ((!FD.isExternallyVisible() && (!Fps || !Fps->isTarget(FD))) ||
+        FD.isWeak() || FD.hasAttr<AsmLabelAttr>() || FD.isNoReturn() || FD.isVariadic() || isa<CXXMethodDecl>(FD) ||
         FD.getTemplatedKind() != FunctionDecl::TK_NonTemplate || Ctx.getLangOpts().CPlusPlus)
       return std::nullopt;
     auto Remaining = walk(FD.getBody(), {Path{}}, 0);
     if (FD.getReturnType()->isVoidType())
       for (auto &P : Remaining) result(nullptr, std::move(P));
-    else if (!Remaining.empty()) Failed = true;
+    else if (!Remaining.empty())
+      fail("fall-through exit without return");
     if (Failed || Cases.empty()) return std::nullopt;
-    return Object{{"version", int64_t(1)}, {"cases", std::move(Cases)}};
+    // The kb codec bounds the whole summary JSON at 65536 bytes; a DNF
+    // grammar can newly reach that envelope, so pre-check here and degrade
+    // to unsupported instead of failing loudly in prepare (审查任务 2 问题5).
+    Object Summary{{"version", int64_t(1)}, {"cases", std::move(Cases)}};
+    llvm::SmallString<8192> Rendered;
+    llvm::raw_svector_ostream Stream(Rendered);
+    Stream << llvm::json::Value(llvm::json::Object(Summary));
+    if (Rendered.size() > 65536) {
+      fail("origin summary beyond the record size budget");
+      return std::nullopt;
+    }
+    return Summary;
   }
 };
 
@@ -862,6 +1241,84 @@ bool supportedCppForwardingFunction(const FunctionDecl &FD) {
 
 // Capture direct forwarding independently of the configured KB. Prepare can
 // recompose the record after a model edit using the cached extraction.
+/* Stage D2: shared argument-mapping grammar for forwarded returns and pure
+ * wrappers — identity param, `!param`, or an integer constant (design
+ * §5.1 in-component transfer input). Pointer arguments stay identity so
+ * output locations map 1:1; arithmetic mappings are outside the frozen
+ * grammar and reject (the case then drops conservatively upstream). */
+bool forwardArgumentMapping(const CallExpr &Call, const FunctionDecl &FD,
+                            const FunctionDecl &Callee, ASTContext &Ctx,
+                            llvm::json::Array &Arguments) {
+  llvm::SmallDenseSet<const VarDecl *, 8> Used;
+  for (unsigned I = 0; I < Call.getNumArgs(); ++I) {
+    const auto *Arg = Call.getArg(I)->IgnoreParenImpCasts();
+    const auto *Param = paramRef(Arg, FD);
+    if (Param && !Param->getType().isVolatileQualified() &&
+        Ctx.hasSameType(Param->getType(), Callee.getParamDecl(I)->getType()) &&
+        Used.insert(Param).second) {
+      const auto *Parm = cast<ParmVarDecl>(Param);
+      Arguments.push_back(llvm::json::Object{
+          {"param", static_cast<int64_t>(Parm->getFunctionScopeIndex()) + 1}});
+      continue;
+    }
+    if (const auto *U = dyn_cast<UnaryOperator>(Arg)) {
+      if (U->getOpcode() == UO_LNot &&
+          Callee.getParamDecl(I)->getType()->isIntegerType()) {
+        const auto *Inner = paramRef(U->getSubExpr()->IgnoreParenImpCasts(), FD);
+        if (Inner && !Inner->getType().isVolatileQualified() &&
+            Inner->getType()->isIntegerType() &&
+            Ctx.hasSameUnqualifiedType(Inner->getType(),
+                                       Callee.getParamDecl(I)->getType()) &&
+            Used.insert(Inner).second) {
+          const auto *Parm = cast<ParmVarDecl>(Inner);
+          Arguments.push_back(llvm::json::Object{
+              {"not", static_cast<int64_t>(Parm->getFunctionScopeIndex()) + 1}});
+          continue;
+        }
+      }
+    }
+    Expr::EvalResult R;
+    if (Arg && Callee.getParamDecl(I)->getType()->isIntegerType() &&
+        Call.getArg(I)->EvaluateAsInt(R, Ctx) && !Call.getArg(I)->HasSideEffects(Ctx)) {
+      if (auto V = R.Val.getInt().tryExtValue()) {
+        Arguments.push_back(llvm::json::Object{{"const", *V}});
+        continue;
+      }
+    }
+    return false;
+  }
+  return true;
+}
+
+// Stage D2: a return value of the shape `callee(args)` becomes a forwarded
+// origin source — the callee's summary applied to the captured mapping.
+// Only direct, prototype, non-variadic project callees qualify; the kb codec
+// and the composition layer share the callee_usr identity.
+std::optional<llvm::json::Object> forwardedReturnSource(
+    const Expr *Expression, const FunctionDecl &FD, ASTContext &Ctx) {
+  const auto *Call =
+      Expression ? dyn_cast<CallExpr>(Expression->IgnoreParens()) : nullptr;
+  const auto *Callee = Call ? Call->getDirectCallee() : nullptr;
+  // The resolver checks the declaration against the selected project
+  // definition. Missing targets remain uncovered.
+  if (!Callee || Callee->isWeak() || Callee->isVariadic() ||
+      Callee->isNoReturn() || !Callee->getType()->isFunctionProtoType() ||
+      Callee->getBuiltinID() || Callee->hasAttr<AsmLabelAttr>() ||
+      Call->getNumArgs() != Callee->getNumParams() ||
+      !Ctx.hasSameType(FD.getReturnType(), Callee->getReturnType()))
+    return std::nullopt;
+  auto USR = generateUSR(*Callee);
+  if (USR.empty())
+    return std::nullopt;
+  llvm::json::Array Arguments;
+  if (!forwardArgumentMapping(*Call, FD, *Callee, Ctx, Arguments))
+    return std::nullopt;
+  return llvm::json::Object{{"kind", "forwarded"},
+                            {"callee_usr", std::move(USR)},
+                            {"signature", canonicalSignature(*Callee, Ctx)},
+                            {"arguments", std::move(Arguments)}};
+}
+
 std::optional<llvm::json::Object> forwardingCall(const FunctionDecl &FD,
                                                 ASTContext &Ctx) {
   if (!FD.isExternallyVisible() || FD.isWeak() || FD.hasAttr<AsmLabelAttr>() ||
@@ -880,6 +1337,9 @@ std::optional<llvm::json::Object> forwardingCall(const FunctionDecl &FD,
   const auto *Call =
       Expression ? dyn_cast<CallExpr>(Expression->IgnoreParens()) : nullptr;
   const auto *Callee = Call ? Call->getDirectCallee() : nullptr;
+  if (Callee && Callee->getIdentifier() && Callee->getIdentifier()->isStr("free") &&
+      !Callee->isDefined())
+    return std::nullopt;
   // Stage B3: the callee may itself be a defined project leaf — prepare
   // composes the wrapper contract from the leaf's extracted ORIGIN records
   // (external callees keep the configured-contract composition path).
@@ -894,52 +1354,16 @@ std::optional<llvm::json::Object> forwardingCall(const FunctionDecl &FD,
   auto USR = generateUSR(*Callee);
   if (USR.empty())
     return std::nullopt;
-  llvm::SmallDenseSet<const VarDecl *, 8> Used;
   llvm::json::Array Arguments;
-  for (unsigned I = 0; I < Call->getNumArgs(); ++I) {
-    const auto *Arg = Call->getArg(I)->IgnoreParenImpCasts();
-    // Stage B3: integer arguments may also be `!param` (guard flip) or an
-    // integer literal (constant folding); pointer arguments stay identity
-    // so output locations map 1:1.
-    const auto *Param = paramRef(Arg, FD);
-    if (Param && !Param->getType().isVolatileQualified() &&
-        Ctx.hasSameType(Param->getType(), Callee->getParamDecl(I)->getType()) &&
-        Used.insert(Param).second) {
-      const auto *Parm = cast<ParmVarDecl>(Param);
-      Arguments.push_back(llvm::json::Object{
-          {"param", static_cast<int64_t>(Parm->getFunctionScopeIndex()) + 1}});
-      continue;
-    }
-    if (const auto *U = dyn_cast<UnaryOperator>(Arg)) {
-      if (U->getOpcode() == UO_LNot &&
-          Callee->getParamDecl(I)->getType()->isIntegerType()) {
-        const auto *Inner = paramRef(U->getSubExpr()->IgnoreParenImpCasts(), FD);
-        if (Inner && !Inner->getType().isVolatileQualified() &&
-            Inner->getType()->isIntegerType() &&
-            Ctx.hasSameUnqualifiedType(Inner->getType(),
-                                       Callee->getParamDecl(I)->getType()) &&
-            Used.insert(Inner).second) {
-          const auto *Parm = cast<ParmVarDecl>(Inner);
-          Arguments.push_back(llvm::json::Object{
-              {"not", static_cast<int64_t>(Parm->getFunctionScopeIndex()) + 1}});
-          continue;
-        }
-      }
-    }
-    Expr::EvalResult R;
-    if (Arg && Callee->getParamDecl(I)->getType()->isIntegerType() &&
-        Arg->EvaluateAsInt(R, Ctx) && !Arg->HasSideEffects(Ctx)) {
-      if (auto V = R.Val.getInt().tryExtValue()) {
-        Arguments.push_back(llvm::json::Object{{"const", *V}});
-        continue;
-      }
-    }
+  if (!forwardArgumentMapping(*Call, FD, *Callee, Ctx, Arguments))
     return std::nullopt;
-  }
-  return llvm::json::Object{{"callee_usr", std::move(USR)},
-                            {"callee", Callee->getQualifiedNameAsString()},
-                            {"signature", canonicalSignature(*Callee, Ctx)},
-                            {"arguments", std::move(Arguments)}};
+  llvm::json::Object Forward{{"callee_usr", std::move(USR)},
+                             {"callee", Callee->getQualifiedNameAsString()},
+                             {"signature", canonicalSignature(*Callee, Ctx)},
+                             {"arguments", std::move(Arguments)}};
+  if (!Ctx.getLangOpts().CPlusPlus && FD.getReturnType()->isPointerType())
+    Forward["origin_member"] = true;
+  return Forward;
 }
 
 class KBExtractConsumer : public ASTConsumer {
@@ -947,11 +1371,11 @@ class KBExtractConsumer : public ASTConsumer {
   std::string SourcePath;
 
   void extractDefinitions(const DeclContext &Context, ASTContext &Ctx,
-                          llvm::json::Array &Entries) {
+                          llvm::json::Array &Entries, FpTargetTable &Fps) {
     auto &SM = Ctx.getSourceManager();
     for (Decl *D : Context.decls()) {
       if (isa<NamespaceDecl, LinkageSpecDecl>(D)) {
-        extractDefinitions(*cast<DeclContext>(D), Ctx, Entries);
+        extractDefinitions(*cast<DeclContext>(D), Ctx, Entries, Fps);
         continue;
       }
       const auto *FD = dyn_cast<FunctionDecl>(D);
@@ -994,14 +1418,25 @@ class KBExtractConsumer : public ASTConsumer {
       bool LegacyComplete = FD->getReturnType()->isPointerType() &&
           LegacyWalker.walkBody(FD->getBody()) == BodyWalker::Flow::Terminates &&
           !LegacyWalker.hasFailed();
-      if (!LegacyComplete) {
-        OriginBody Origin(*FD, Ctx, SourcePath);
+      if (!LegacyComplete || (!FD->isExternallyVisible() && Fps.isTarget(*FD))) {
+        OriginBody Origin(*FD, Ctx, SourcePath, &Fps);
         if (auto Summary = Origin.extract()) {
           llvm::json::Object Rec{{"schema", int64_t(2)}, {"function", E.name},
               {"signature", E.signature}, {"unoverloaded", false}, {"kind", "ORIGIN"},
               {"file", SourcePath}, {"line", int64_t(E.line)}, {"origins", std::move(*Summary)}};
           JE["coverage"] = "complete";
+          if (Origin.hasDispatch()) JE["indirect_dispatch"] = true;
+          if (!FD->isExternallyVisible()) JE["solver_only"] = true;
           JE["records"] = llvm::json::Array{std::move(Rec)};
+          Entries.push_back(std::move(JE));
+          continue;
+        }
+        // The joint path attempted and failed: its reason (e.g. compound
+        // guard beyond the frozen budget) is the truthful diagnostic; the
+        // legacy walker's message would only describe the fallback attempt.
+        if (Origin.hasFailed() && !LegacyComplete) {
+          JE["coverage"] = "unsupported";
+          JE["reason"] = Origin.failureWhy();
           Entries.push_back(std::move(JE));
           continue;
         }
@@ -1067,13 +1502,155 @@ class KBExtractConsumer : public ASTConsumer {
     }
   }
 
+  // Stage D3: recursive statement scan for writes to / address-takes of
+  // trackable function-pointer globals.
+  // Resolve an assignment RHS to a set of direct function targets: a direct
+  // reference (with or without &), or a ternary over recognizable branches
+  // (the D3 dispatch union). nullopt = unrecognized write (opens the set).
+  static std::optional<std::set<const FunctionDecl *>>
+  resolveFpTargets(const Expr *E, unsigned depth = 0) {
+    if (!E || depth > 8) return std::nullopt;
+    const Expr *rhs = E->IgnoreParenImpCasts();
+    if (const auto *rr = dyn_cast<DeclRefExpr>(rhs)) {
+      if (const auto *target = dyn_cast<FunctionDecl>(rr->getDecl()))
+        if (!target->isVariadic() && !target->isNoReturn() &&
+            target->getType()->isFunctionProtoType() && !target->getBuiltinID())
+          return std::set<const FunctionDecl *>{target};
+      return std::nullopt;
+    }
+    if (const auto *uo = dyn_cast<UnaryOperator>(rhs))
+      if (uo->getOpcode() == UO_AddrOf)
+        return resolveFpTargets(uo->getSubExpr(), depth + 1);
+    if (const auto *cond = dyn_cast<ConditionalOperator>(rhs)) {
+      auto t = resolveFpTargets(cond->getTrueExpr(), depth + 1);
+      auto f = resolveFpTargets(cond->getFalseExpr(), depth + 1);
+      if (!t || !f) return std::nullopt;
+      std::set<const FunctionDecl *> out = *t;
+      out.insert(f->begin(), f->end());
+      return out;
+    }
+    return std::nullopt;
+  }
+
+  class FpTargetScanner : public RecursiveASTVisitor<FpTargetScanner> {
+    ASTContext &Ctx;
+    FpTargetTable &Table;
+    llvm::json::Array &Objects;
+    llvm::SmallDenseSet<const Expr *, 16> Classified;
+
+    void appendLayout(QualType type, llvm::raw_ostream &out,
+                      llvm::SmallPtrSetImpl<const RecordDecl *> &seen) {
+      if (const auto *array = Ctx.getAsArrayType(type)) {
+        appendLayout(array->getElementType(), out, seen);
+        return;
+      }
+      const auto *record = type->getAs<RecordType>();
+      const auto *definition = record ? record->getDecl()->getDefinition() : nullptr;
+      if (!definition || definition->isInvalidDecl() || !seen.insert(definition).second)
+        return;
+      const auto &layout = Ctx.getASTRecordLayout(definition);
+      out << "\nlayout " << definition->isUnion() << ' '
+          << layout.getSize().getQuantity() << ' ' << layout.getAlignment().getQuantity();
+      unsigned index = 0;
+      for (const auto *field : definition->fields()) {
+        out << '\n' << layout.getFieldOffset(index++) << ' ' << field->getName()
+            << ' ' << field->getType().getCanonicalType().getAsString();
+        if (field->isBitField()) out << ' ' << field->getBitWidthValue();
+        appendLayout(field->getType(), out, seen);
+      }
+    }
+
+    void recordWrite(const VarDecl &fp, const Expr *value) {
+      const auto *key = fp.getCanonicalDecl();
+      if (auto targets = resolveFpTargets(value)) {
+        Table.targets[key].insert(targets->begin(), targets->end());
+        for (const auto *target : *targets)
+          Table.functionTargets.insert(target->getCanonicalDecl());
+      } else {
+        Table.open.insert(key);
+      }
+    }
+
+  public:
+    FpTargetScanner(ASTContext &ctx, FpTargetTable &table,
+                    llvm::json::Array &objects)
+        : Ctx(ctx), Table(table), Objects(objects) {}
+
+    bool VisitVarDecl(VarDecl *decl) {
+      if (decl->hasAttr<AliasAttr>() || decl->hasAttr<WeakRefAttr>())
+        Table.unmodeledStorage = true;
+      if (FpTargetTable::isTrackable(*decl, Ctx) && decl->hasInit())
+        recordWrite(*decl, decl->getInit());
+      if ((decl->isFileVarDecl() || decl->isStaticLocal()) &&
+          decl->isThisDeclarationADefinition()) {
+        llvm::SmallString<128> usr;
+        if (!index::generateUSRForDecl(decl, usr)) {
+          std::string content;
+          llvm::raw_string_ostream stream(content);
+          decl->print(stream, Ctx.getPrintingPolicy());
+          stream << '\n' << decl->getType().getCanonicalType().getAsString();
+          llvm::SmallPtrSet<const RecordDecl *, 8> seen;
+          appendLayout(decl->getType(), stream, seen);
+          llvm::SHA256 digest;
+          digest.update(content);
+          Objects.push_back(llvm::json::Object{
+              {"usr", usr.str().str()}, {"external", decl->isExternallyVisible()},
+              {"sha256", llvm::toHex(digest.final(), /*LowerCase=*/true)}});
+        }
+      }
+      return true;
+    }
+
+    bool VisitFileScopeAsmDecl(FileScopeAsmDecl *) {
+      Table.unmodeledStorage = true;
+      return true;
+    }
+
+    bool VisitAsmStmt(AsmStmt *) {
+      Table.unmodeledStorage = true;
+      return true;
+    }
+
+    bool VisitBinaryOperator(BinaryOperator *assignment) {
+      if (assignment->getOpcode() != BO_Assign) return true;
+      const auto *ref = dyn_cast<DeclRefExpr>(assignment->getLHS()->IgnoreParens());
+      const auto *fp = ref ? dyn_cast<VarDecl>(ref->getDecl()) : nullptr;
+      if (fp && FpTargetTable::isTrackable(*fp, Ctx)) {
+        Classified.insert(ref);
+        recordWrite(*fp, assignment->getRHS());
+      }
+      return true;
+    }
+
+    bool VisitImplicitCastExpr(ImplicitCastExpr *cast) {
+      if (cast->getCastKind() == CK_LValueToRValue)
+        if (const auto *ref = dyn_cast<DeclRefExpr>(cast->getSubExpr()->IgnoreParens()))
+          if (const auto *fp = dyn_cast<VarDecl>(ref->getDecl()))
+            if (FpTargetTable::isTrackable(*fp, Ctx))
+              Classified.insert(ref); // Reading the value cannot mutate storage.
+      return true;
+    }
+
+    bool VisitDeclRefExpr(DeclRefExpr *ref) {
+      if (const auto *fp = dyn_cast<VarDecl>(ref->getDecl()))
+        if (FpTargetTable::isTrackable(*fp, Ctx) && !Classified.count(ref))
+          Table.open.insert(fp->getCanonicalDecl());
+      return true;
+    }
+  };
+
   void HandleTranslationUnit(ASTContext &Ctx) override {
     llvm::json::Array Entries;
-    extractDefinitions(*Ctx.getTranslationUnitDecl(), Ctx, Entries);
+    FpTargetTable Fps;
+    llvm::json::Array Objects;
+    if (!Ctx.getLangOpts().CPlusPlus)
+      FpTargetScanner(Ctx, Fps, Objects).TraverseDecl(Ctx.getTranslationUnitDecl());
+    extractDefinitions(*Ctx.getTranslationUnitDecl(), Ctx, Entries, Fps);
     llvm::json::Object Root;
     Root["schema"] = 1;
     Root["file"] = SourcePath;
     Root["entries"] = std::move(Entries);
+    Root["objects"] = std::move(Objects);
     std::error_code EC;
     llvm::raw_fd_ostream Out(OutPath, EC, llvm::sys::fs::OF_Text);
     if (EC) {
