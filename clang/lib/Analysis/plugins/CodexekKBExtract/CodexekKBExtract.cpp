@@ -57,6 +57,7 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
+#include "clang/Sema/Sema.h"
 #include "clang/UnifiedSymbolResolution/USRGeneration.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseSet.h"
@@ -1366,7 +1367,157 @@ std::optional<llvm::json::Object> forwardingCall(const FunctionDecl &FD,
   return Forward;
 }
 
+// Prove the normal-return upper bound for a signed scalar whose storage is
+// private to the caller and is only exposed through this parameter. A use of
+// the pointer can read the scalar, decrement it, or forward it to a visible
+// definition with the same proof. All other uses could escape it or write an
+// increased value. The runtime checks the private-storage precondition.
+class OutputBoundProof {
+  ASTContext &Ctx;
+  Sema *SemanticAnalysis;
+  llvm::SmallPtrSet<const FunctionDecl *, 8> Active;
+  unsigned Budget = 4096;
+  bool SawDecrement = false;
+
+  static const DeclRefExpr *reference(const Expr *ExprNode) {
+    return dyn_cast<DeclRefExpr>(ExprNode->IgnoreParenImpCasts());
+  }
+
+  static bool dereferences(const Expr *ExprNode, const ParmVarDecl &Param) {
+    const auto *Unary = dyn_cast<UnaryOperator>(ExprNode->IgnoreParens());
+    if (!Unary || Unary->getOpcode() != UO_Deref)
+      return false;
+    const auto *Ref = reference(Unary->getSubExpr());
+    return Ref && Ref->getDecl() == &Param;
+  }
+
+  const FunctionDecl *definition(const CallExpr &Call) {
+    const auto *Callee = Call.getDirectCallee();
+    if (!Callee) return nullptr;
+    if (const auto *Definition = Callee->getDefinition()) return Definition;
+    // EmitAST may defer instantiating the actual specialization. Analyze
+    // that specialization, including its resolved overloads, and never the
+    // uninstantiated function pattern.
+    if (SemanticAnalysis &&
+        Callee->getTemplateSpecializationKind() == TSK_ImplicitInstantiation &&
+        !Callee->isInvalidDecl()) {
+      const auto *Pattern = Callee->getTemplateInstantiationPattern();
+      if (Pattern && Pattern->hasBody()) {
+        SemanticAnalysis->InstantiateFunctionDefinition(
+            Call.getExprLoc(), const_cast<FunctionDecl *>(Callee), false, false, true);
+        if (!Callee->isInvalidDecl()) return Callee->getDefinition();
+      }
+    }
+    return nullptr;
+  }
+
+  bool walk(const Stmt *Node, const ParmVarDecl &Param) {
+    if (!Node)
+      return true;
+    if (!Budget)
+      return false;
+    --Budget;
+    // Blocks and outlined statements can carry effects outside this walk.
+    if (isa<AsmStmt, BlockExpr, CapturedStmt>(Node))
+      return false;
+    // Some evaluated bounds of variably modified types live in TypeLocs,
+    // outside the statement children (for example, a pointer to a VLA).
+    if (const auto *Decls = dyn_cast<DeclStmt>(Node))
+      for (const auto *Decl : Decls->decls()) {
+        if (const auto *Var = dyn_cast<VarDecl>(Decl))
+          if (Var->getType()->isVariablyModifiedType()) return false;
+        if (const auto *Alias = dyn_cast<TypedefNameDecl>(Decl))
+          if (Alias->getUnderlyingType()->isVariablyModifiedType()) return false;
+      }
+    if (const auto *Expression = dyn_cast<Expr>(Node))
+      if (Expression->getType()->isVariablyModifiedType()) return false;
+    if (const auto *Trait = dyn_cast<UnaryExprOrTypeTraitExpr>(Node))
+      if (Trait->isArgumentType() && Trait->getArgumentType()->isVariablyModifiedType())
+        return false;
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(Node))
+      return Ref->getDecl() != &Param;
+    if (const auto *Lambda = dyn_cast<LambdaExpr>(Node))
+      for (const auto &Capture : Lambda->captures())
+        if (Capture.capturesVariable() && Capture.getCapturedVar() == &Param)
+          return false;
+    if (const auto *Cast = dyn_cast<ImplicitCastExpr>(Node))
+      if (Cast->getCastKind() == CK_LValueToRValue &&
+          dereferences(Cast->getSubExpr(), Param))
+        return true;
+    if (const auto *Unary = dyn_cast<UnaryOperator>(Node))
+      if (Unary->isDecrementOp() && dereferences(Unary->getSubExpr(), Param)) {
+        SawDecrement = true;
+        return true;
+      }
+    if (const auto *Call = dyn_cast<CallExpr>(Node)) {
+      const Expr *Forwarded = nullptr;
+      for (unsigned I = 0; I < Call->getNumArgs(); ++I) {
+        const auto *Arg = Call->getArg(I);
+        const auto *Ref = reference(Arg);
+        if (!Ref || Ref->getDecl() != &Param)
+          continue;
+        const auto *Definition = Forwarded ? nullptr : definition(*Call);
+        if (Forwarded || !Definition || I >= Definition->getNumParams() ||
+            !Ctx.hasSameType(Definition->getParamDecl(I)->getType(), Param.getType()) ||
+            !prove(*Definition, I))
+          return false;
+        Forwarded = Arg;
+      }
+      for (const auto *Child : Node->children())
+        if (Child != Forwarded && !walk(Child, Param))
+          return false;
+      return true;
+    }
+    for (const auto *Child : Node->children())
+      if (!walk(Child, Param))
+        return false;
+    return true;
+  }
+
+  bool prove(const FunctionDecl &Function, unsigned Argument) {
+    if (isa<CXXMethodDecl>(Function) || Function.isWeak() ||
+        Function.hasAttr<AsmLabelAttr>() || Function.hasAttr<AliasAttr>() ||
+        Function.hasAttr<IFuncAttr>() || Function.isVariadic() ||
+        !Function.getBody() || llvm::any_of(Function.parameters(), [](const ParmVarDecl *Param) {
+          return Param->getOriginalType()->isVariablyModifiedType();
+        }) || Active.size() == 8 ||
+        !Active.insert(Function.getCanonicalDecl()).second)
+      return false;
+    const bool Pass = walk(Function.getBody(), *Function.getParamDecl(Argument));
+    Active.erase(Function.getCanonicalDecl());
+    return Pass;
+  }
+
+public:
+  OutputBoundProof(ASTContext &Context, Sema *SemanticAnalysis)
+      : Ctx(Context), SemanticAnalysis(SemanticAnalysis) {}
+
+  bool check(const FunctionDecl &Function, unsigned Argument) {
+    const auto Type = Function.getParamDecl(Argument)->getType();
+    if (!Type->isPointerType())
+      return false;
+    const auto Pointee = Type->getPointeeType();
+    return !Pointee.hasQualifiers() && Pointee->isSignedIntegerType() &&
+           Ctx.getIntWidth(Pointee) >= Ctx.getIntWidth(Ctx.IntTy) &&
+           prove(Function, Argument) && SawDecrement;
+  }
+};
+
+static std::optional<unsigned> outputBound(const FunctionDecl &Function,
+                                          ASTContext &Ctx, Sema *SemanticAnalysis) {
+  if (!Function.isExternallyVisible() || Function.getLanguageLinkage() != CXXLanguageLinkage ||
+      !Function.getReturnType()->isVoidType() ||
+      Function.getTemplatedKind() != FunctionDecl::TK_NonTemplate ||
+      Ctx.getLangOpts().isSignedOverflowDefined() || Function.getNumParams() > 16)
+    return std::nullopt;
+  for (unsigned I = 0; I < Function.getNumParams(); ++I)
+    if (OutputBoundProof(Ctx, SemanticAnalysis).check(Function, I))
+      return I + 1;
+  return std::nullopt;
+}
+
 class KBExtractConsumer : public ASTConsumer {
+  CompilerInstance &Compiler;
   std::string OutPath;
   std::string SourcePath;
 
@@ -1400,6 +1551,17 @@ class KBExtractConsumer : public ASTConsumer {
           })) {
         JE["coverage"] = "unsupported";
         JE["reason"] = "variably modified parameter has unmodeled entry evaluation";
+        Entries.push_back(std::move(JE));
+        continue;
+      }
+      if (auto Argument = outputBound(*FD, Ctx, Compiler.hasSema() ? &Compiler.getSema() : nullptr)) {
+        JE["coverage"] = "complete";
+        JE["records"] = llvm::json::Array{llvm::json::Object{
+            {"schema", int64_t(2)}, {"function", E.name},
+            {"signature", E.signature}, {"unoverloaded", false},
+            {"kind", "OUT"}, {"file", SourcePath}, {"line", int64_t(E.line)},
+            {"target", llvm::json::Object{{"slot", "output"},
+                                         {"index", int64_t(*Argument)}}}}};
         Entries.push_back(std::move(JE));
         continue;
       }
@@ -1662,8 +1824,8 @@ class KBExtractConsumer : public ASTConsumer {
   }
 
 public:
-  KBExtractConsumer(StringRef InFile, StringRef Out)
-      : OutPath(Out.str()), SourcePath(InFile.str()) {}
+  KBExtractConsumer(CompilerInstance &Compiler, StringRef InFile, StringRef Out)
+      : Compiler(Compiler), OutPath(Out.str()), SourcePath(InFile.str()) {}
 };
 
 class KBExtractAction : public PluginASTAction {
@@ -1674,7 +1836,7 @@ protected:
   std::unique_ptr<ASTConsumer>
   CreateASTConsumer(CompilerInstance &CI, StringRef InFile) override {
     SourcePath = InFile.str();
-    return std::make_unique<KBExtractConsumer>(InFile, OutPath);
+    return std::make_unique<KBExtractConsumer>(CI, InFile, OutPath);
   }
 
   bool ParseArgs(const CompilerInstance &CI,
